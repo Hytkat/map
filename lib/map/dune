@@ -1,0 +1,4 @@
+(library
+ (name map)
+ (public_name map)
+ (modules hello))
