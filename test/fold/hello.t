@@ -1,4 +1,4 @@
 First test
 
   $ fold
-  Greetings from the map library!
+  Greetings from the mapv library!

@@ -2,5 +2,5 @@
  (name main)
  (public_name fold)
  (package fold)
- (libraries map)
+ (libraries mapv)
  (modules main))

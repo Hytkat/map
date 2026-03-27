@@ -55,7 +55,7 @@
           };
 
           devPackagesQuery = {
-            map = "*";
+            mapv = "*";
             ocamlformat = "*";
             ocaml-lsp-server = "*";
           };
@@ -81,18 +81,17 @@
           };
 
           packages = {
-            map-vm = scope.map;
-            inherit (scope) fold;
+            inherit (scope) mapv fold;
             fmt = self'.formatter;
           };
 
           overlayAttrs = {
-            ocamlPackages.map-vm = scope.map;
+            ocamlPackages.mapv = scope.mapv;
             inherit (scope) fold;
           };
 
           devShells.default = pkgs.mkShell {
-            name = "map-dev";
+            name = "mapv-dev";
             inputsFrom = [ scope.fold ];
             nativeBuildInputs = devPackages;
           };

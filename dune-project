@@ -9,15 +9,14 @@
 (source
  (codeberg debarchito/map))
 
-(license GPL-3.0-only)
-
 (authors "Debarchito Nath <debarchiton@proton.me>")
 
 (maintainers "Debarchito Nath <debarchiton@proton.me>")
 
 (package
- (name map)
- (description "A visualizable VM")
+ (name mapv)
+ (description "An embedable and visualizable VM for OCaml")
+ (license LGPL-3.0-only)
  (depends
   (ocaml
    (>= "5.4.1"))
@@ -26,11 +25,12 @@
 
 (package
  (name fold)
- (description "A simple lisp than run on top of the map VM")
+ (description "An infuriatingly elegant lisp for the Mapv VM")
+ (license GPL-3.0-only)
  (depends
   (ocaml
    (>= "5.4.1"))
-  map
+  mapv
   (menhir
    (>= "20260209"))
   (raylib
