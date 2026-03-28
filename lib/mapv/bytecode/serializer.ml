@@ -1,8 +1,5 @@
 open Core
 
-exception Panic of string
-exception ParseError of string
-
 let magic = "MAPV"
 let edition = 2026
 let sec_imports = 0x00
@@ -23,6 +20,42 @@ type program = {
   debug : debug_info array;
 }
 
+let check_constants constants =
+  Array.iteri
+    (fun i v ->
+      match v with
+      | Value.NativeFun _ ->
+          raise
+            (Exception.Panic
+               (Exception.Invalid_registry
+                  (Format.asprintf
+                     "serializer: constant[%d] is NativeFun — not serializable"
+                     i)))
+      | Value.NativePtr _ ->
+          raise
+            (Exception.Panic
+               (Exception.Invalid_registry
+                  (Format.asprintf
+                     "serializer: constant[%d] is NativePtr — not serializable"
+                     i)))
+      | _ -> ())
+    constants
+
+let validate_imports imports registry =
+  Array.iter
+    (fun imp ->
+      let id = Int64.to_int imp.symbol_id in
+      match Exception.Registry.name_of registry id with
+      | None ->
+          raise
+            (Exception.Panic
+               (Exception.Invalid_registry
+                  (Format.asprintf
+                     "serializer: import '%s' (sym=0x%Lx) not found in registry"
+                     imp.name imp.symbol_id)))
+      | Some _ -> ())
+    imports
+
 module Write = struct
   let align buf n =
     let remainder = Buffer.length buf mod n in
@@ -34,22 +67,22 @@ module Write = struct
   let u8 buf v = Buffer.add_uint8 buf v
   let u16 buf v = Buffer.add_uint16_le buf v
   let u32 buf v = Buffer.add_int32_le buf (Int32.of_int v)
-  let u64_le buf v = Buffer.add_int64_le buf v
+  let u64 buf v = Buffer.add_int64_le buf v
 
-  let u64_aligned buf v =
+  let f64 buf v =
     align buf 8;
-    u64_le buf v
+    u64 buf (Int64.bits_of_float v)
 
-  let f64_aligned buf v =
+  let u64a buf v =
     align buf 8;
-    u64_le buf (Int64.bits_of_float v)
+    u64 buf v
 
   let string buf s =
     u32 buf (String.length s);
     Buffer.add_string buf s
 
   let i32 buf v = Buffer.add_int32_le buf (Int32.of_int v)
-  let i64v buf v = u64_le buf v
+  let i64v buf v = u64 buf v
 
   let value buf = function
     | Value.Nil -> u8 buf 0
@@ -58,14 +91,18 @@ module Write = struct
         u8 buf (if b then 1 else 0)
     | Value.Int n ->
         u8 buf 2;
-        u64_aligned buf (Int64.of_int n)
+        u64a buf (Int64.of_int n)
     | Value.Float f ->
         u8 buf 3;
-        f64_aligned buf f
+        f64 buf f
     | Value.Ptr p ->
         u8 buf 4;
         u32 buf p
-    | _ -> raise (Panic "non-serializable value")
+    | Value.NativeFun _ | Value.NativePtr _ ->
+        raise
+          (Exception.Panic
+             (Exception.Invalid_registry
+                "serializer: attempted to serialize non-serializable value"))
 
   let instr buf i =
     let header op a b c =
@@ -83,7 +120,7 @@ module Write = struct
         i32 buf n
     | Instr.LoadF (d, f) ->
         header 0x04 d 0 0;
-        f64_aligned buf f
+        f64 buf f
     | Instr.LoadB (d, b) -> header 0x05 d (if b then 1 else 0) 0
     | Instr.LoadNil d -> header 0x06 d 0 0
     | Instr.LoadK (d, i) ->
@@ -206,17 +243,16 @@ module Write = struct
     Array.iter (debug_entry buf) d.entries
 
   let program buf prog =
+    check_constants prog.constants;
     Buffer.add_string buf magic;
     u16 buf prog.edition;
     u16 buf 0;
-
     let compile_sec id data writer =
       let b = Buffer.create 128 in
       u32 b (Array.length data);
       Array.iter (writer b) data;
       (id, b)
     in
-
     let compiled = [] in
     let compiled =
       if Array.length prog.imports > 0 then
@@ -230,14 +266,11 @@ module Write = struct
         compile_sec sec_debug prog.debug debug_info :: compiled
       else compiled
     in
-
     let compiled = List.rev compiled in
     let sec_count = List.length compiled in
     u32 buf sec_count;
-
     let header_off = 8 + 4 + (sec_count * 12) in
     let current_off = ref header_off in
-
     List.iter
       (fun (id, b) ->
         let padding = (8 - (!current_off mod 8)) mod 8 in
@@ -247,7 +280,6 @@ module Write = struct
         u32 buf (Buffer.length b);
         current_off := start + Buffer.length b)
       compiled;
-
     List.iter
       (fun (_, b) ->
         align buf 8;
@@ -304,7 +336,11 @@ module Read = struct
         Value.Int (Int64.to_int (u64 cur))
     | 3 -> Value.Float (f64 cur)
     | 4 -> Value.Ptr (u32 cur)
-    | _ -> raise (ParseError "unknown value tag")
+    | t ->
+        raise
+          (Exception.Panic
+             (Exception.Alloc_error
+                (Format.asprintf "serializer: unknown constant type tag %d" t)))
 
   let instr cur =
     let op = u8 cur in
@@ -380,7 +416,11 @@ module Read = struct
     | 0x91 -> Instr.ConYield (a, b)
     | 0x92 -> Instr.ConResume (a, b, c)
     | 0x93 -> Instr.ConStatus (a, b)
-    | _ -> raise (ParseError "unknown opcode")
+    | op ->
+        raise
+          (Exception.Panic
+             (Exception.Alloc_error
+                (Format.asprintf "serializer: unknown opcode 0x%02X" op)))
 
   let func cur =
     let name = string cur in
@@ -388,6 +428,11 @@ module Read = struct
     align cur 4;
     let n = u32 cur in
     { name; arity; code = Array.init n (fun _ -> instr cur) }
+
+  let import cur =
+    let symbol_id = i64v cur in
+    let name = string cur in
+    { symbol_id; name }
 
   let debug_entry cur =
     let instr_offset = u32 cur in
@@ -402,8 +447,21 @@ module Read = struct
     { func_idx; entries = Array.init n (fun _ -> debug_entry cur) }
 
   let program cur =
+    let m = Bytes.sub_string cur.data cur.pos 4 in
+    if m <> magic then
+      raise
+        (Exception.Panic
+           (Exception.Alloc_error
+              (Format.asprintf "serializer: invalid magic %S (expected %S)" m
+                 magic)));
     cur.pos <- 4;
     let ed = u16 cur in
+    if ed <> edition then
+      raise
+        (Exception.Panic
+           (Exception.Alloc_error
+              (Format.asprintf "serializer: unknown edition %d (expected %d)" ed
+                 edition)));
     cur.pos <- 8;
     let n_sec = u32 cur in
     let secs =
@@ -416,48 +474,58 @@ module Read = struct
     let get_sec id =
       Array.find_map (fun (i, o, _) -> if i = id then Some o else None) secs
     in
+    let require_sec id name =
+      match get_sec id with
+      | Some o -> o
+      | None ->
+          raise
+            (Exception.Panic
+               (Exception.Alloc_error
+                  (Format.asprintf "serializer: missing required section '%s'"
+                     name)))
+    in
     let load_array id loader =
       match get_sec id with
+      | None -> [||]
       | Some o ->
           seek cur o;
           let n = u32 cur in
           Array.init n (fun _ -> loader cur)
-      | None -> [||]
+    in
+    let load_required_array id name loader =
+      let o = require_sec id name in
+      seek cur o;
+      let n = u32 cur in
+      Array.init n (fun _ -> loader cur)
     in
     {
       edition = ed;
-      imports =
-        load_array sec_imports (fun c ->
-            let s = i64v c in
-            { symbol_id = s; name = string c });
-      constants = load_array sec_constants value;
-      funcs = load_array sec_functions func;
+      imports = load_array sec_imports import;
+      constants = load_required_array sec_constants "constants" value;
+      funcs = load_required_array sec_functions "functions" func;
       debug = load_array sec_debug debug_info;
     }
 end
 
 let serialize prog =
-  let b = Buffer.create 1024 in
-  Write.program b prog;
-  Buffer.to_bytes b
+  let buf = Buffer.create 1024 in
+  Write.program buf prog;
+  Buffer.to_bytes buf
 
 let deserialize data = Read.program (Read.make data)
 
-let serialize_to_file path p =
+let serialize_to_file path prog =
+  let b = serialize prog in
   let oc = open_out_bin path in
-  Fun.protect
-    ~finally:(fun () -> close_out oc)
-    (fun () ->
-      let b = serialize p in
-      output_bytes oc b;
-      b)
+  Fun.protect ~finally:(fun () -> close_out oc) (fun () -> output_bytes oc b);
+  b
 
 let deserialize_from_file path =
   let ic = open_in_bin path in
   Fun.protect
     ~finally:(fun () -> close_in ic)
     (fun () ->
-      let len = in_channel_length ic in
-      let b = Bytes.create len in
-      really_input ic b 0 len;
+      let n = in_channel_length ic in
+      let b = Bytes.create n in
+      really_input ic b 0 n;
       deserialize b)

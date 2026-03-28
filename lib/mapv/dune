@@ -2,4 +2,5 @@
 
 (library
  (name mapv)
- (public_name mapv))
+ (public_name mapv)
+ (libraries raylib))

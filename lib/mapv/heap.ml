@@ -53,12 +53,12 @@ end
 
 module Tracing = struct
   type ctx = {
-    mutable allocs : (int * int * int) list;
-    mutable frees : int list;
-    mutable promotes : int list;
-    mutable events : event list;
-    mutable reads : (int * int) list;
-    mutable writes : (int * int * Value.t) list;
+    mutable allocs : (int * int * int * int) list;
+    mutable frees : (int * int) list;
+    mutable promotes : (int * int) list;
+    mutable events : (int * event) list;
+    mutable reads : (int * int * int) list;
+    mutable writes : (int * int * int * Value.t) list;
     metadata : bytes;
     chunk_size : int;
     sample_rate : int;
@@ -80,22 +80,22 @@ module Tracing = struct
     }
 
   let on_alloc ctx ~addr ~size ~tag =
-    ctx.allocs <- (addr, size, tag) :: ctx.allocs
+    ctx.allocs <- (ctx.tick, addr, size, tag) :: ctx.allocs
 
-  let on_free ctx ~addr = ctx.frees <- addr :: ctx.frees
-  let on_promote ctx ~addr = ctx.promotes <- addr :: ctx.promotes
-  let on_gc ctx ev = ctx.events <- ev :: ctx.events
+  let on_free ctx ~addr = ctx.frees <- (ctx.tick, addr) :: ctx.frees
+  let on_promote ctx ~addr = ctx.promotes <- (ctx.tick, addr) :: ctx.promotes
+  let on_gc ctx ev = ctx.events <- (ctx.tick, ev) :: ctx.events
 
   let on_read ctx ~addr ~field v =
     ctx.tick <- ctx.tick + 1;
     if ctx.tick mod ctx.sample_rate = 0 then
-      ctx.reads <- (addr, field) :: ctx.reads;
+      ctx.reads <- (ctx.tick, addr, field) :: ctx.reads;
     ignore v
 
   let on_write ctx ~addr ~field v =
     ctx.tick <- ctx.tick + 1;
     if ctx.tick mod ctx.sample_rate = 0 then begin
-      ctx.writes <- (addr, field, v) :: ctx.writes;
+      ctx.writes <- (ctx.tick, addr, field, v) :: ctx.writes;
       let slot = addr + field in
       if slot < Bytes.length ctx.metadata then
         Bytes.set ctx.metadata slot

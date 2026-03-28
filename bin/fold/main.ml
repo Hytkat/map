@@ -1,101 +1,100 @@
+open Mapv
 open Mapv.Core
 open Mapv.Bytecode
 
-let () =
-  let all_instructions =
-    Instr.
+let factorial_code =
+  Instr.
+    [|
+      Load (1, 10);
+      Load (2, 1);
+      Load (3, 0);
+      Eq (4, 1, 3);
+      Jnz (4, 56);
+      Mul (2, 2, 1);
+      SubI (1, 1, 1);
+      Jmp 24;
+      ConYield (0, 2);
+      Halt;
+    |]
+
+let fibonacci_code =
+  Instr.
+    [|
+      Load (1, 10);
+      Load (2, 0);
+      Load (3, 1);
+      Load (4, 0);
+      Lt (5, 4, 1);
+      Jz (5, 72);
+      Add (6, 2, 3);
+      Mov (2, 3);
+      Mov (3, 6);
+      AddI (4, 4, 1);
+      Jmp 32;
+      ConYield (0, 2);
+      Halt;
+    |]
+
+let scheduler_code =
+  Instr.
+    [|
+      LoadK (0, 1);
+      LoadK (1, 2);
+      ConNew (2, 0);
+      ConNew (3, 1);
+      LoadNil 4;
+      ConResume (5, 2, 4);
+      ConResume (6, 3, 4);
+      Halt;
+    |]
+
+let program : Serializer.program =
+  {
+    edition = Serializer.edition;
+    imports = [||];
+    constants = [||];
+    funcs =
       [|
-        Nop;
-        Halt;
-        Mov (0, 1);
-        Load (2, 42);
-        LoadF (3, 3.14159);
-        LoadB (4, true);
-        LoadNil 5;
-        LoadK (6, 128);
-        LoadS (7, 0xDEADBEEFL);
-        Add (8, 9, 10);
-        Sub (11, 12, 13);
-        Mul (14, 15, 16);
-        Div (17, 18, 19);
-        Mod (20, 21, 22);
-        AddI (23, 24, 100);
-        SubI (25, 26, 200);
-        MulI (27, 28, 300);
-        AddF (29, 30, 31);
-        SubF (32, 33, 34);
-        MulF (35, 36, 37);
-        DivF (38, 39, 40);
-        And (41, 42, 43);
-        Or (44, 45, 46);
-        Xor (47, 48, 49);
-        Shl (50, 51, 52);
-        Shr (53, 54, 55);
-        ShrU (56, 57, 58);
-        ShlI (59, 60, 4);
-        ShrI (61, 62, 2);
-        ShrUI (63, 64, 1);
-        Eq (65, 66, 67);
-        Ne (68, 69, 70);
-        Lt (71, 72, 73);
-        LtU (74, 75, 76);
-        Lte (77, 78, 79);
-        LteU (80, 81, 82);
-        EqF (83, 84, 85);
-        NeF (86, 87, 88);
-        LtF (89, 90, 91);
-        LteF (92, 93, 94);
-        I2F (95, 96);
-        F2I (97, 98);
-        TypeOf (99, 100);
-        Alloc (101, 1, 16);
-        GetField (102, 103, 2);
-        SetField (104, 3, 105);
-        GetTag (106, 107);
-        Len (108, 109);
-        Jmp 0;
-        Jz (110, 5);
-        Jnz (111, 10);
-        Call (120, 0, 2, 112);
-        TailCall (130, 3, 5);
-        DynCall (113, 6, 8, 114);
-        TailDynCall (115, 9, 11);
-        Ret 116;
-        Try (200, 117);
-        Throw 118;
-        EndTry;
-        ConNew (119, 120);
-        ConYield (121, 122);
-        ConResume (123, 124, 125);
-        ConStatus (126, 127);
-      |]
+        { name = "scheduler"; arity = 0; code = scheduler_code };
+        { name = "factorial"; arity = 0; code = factorial_code };
+        { name = "fibonacci"; arity = 0; code = fibonacci_code };
+      |];
+    debug = [||];
+  }
+
+let () =
+  let module H = Heap.Make (Heap.Tracing) in
+  let module VM = Vm.Make (H) (Vm.Tracing) in
+  let module L = Loader.Make (H) (VM) in
+  ignore (Serializer.serialize_to_file "_fiber_demo.mapv" program);
+  let loaded = Serializer.deserialize_from_file "_fiber_demo.mapv" in
+  Array.iter
+    (fun (f : Serializer.func) ->
+      Printf.printf "%s (arity=%d):\n" f.name f.arity;
+      Instr.inspect f.code;
+      print_newline ())
+    loaded.funcs;
+  let heap_ctx =
+    Heap.Tracing.make ~max_chunks:Config.default.heap.max_chunks
+      ~chunk_size:Config.default.heap.chunk_size ~sample_rate:10
   in
-
-  let prog_to_file : Serializer.program =
-    {
-      edition = Serializer.edition;
-      imports = [| { symbol_id = 1L; name = "test.internal" } |];
-      constants = [| Value.Int 42; Value.Float 2.718 |];
-      funcs = [| { name = "full_test"; arity = 0; code = all_instructions } |];
-      debug = [||];
-    }
+  let vm_ctx = Vm.Tracing.make () in
+  let vm = L.load_file "_fiber_demo.mapv" Config.default heap_ctx vm_ctx in
+  (match VM.run vm with
+  | () -> ()
+  | exception Exception.Signal s ->
+      Printf.printf "uncaught signal: %s\n" (Exception.signal_message s);
+      exit 1
+  | exception Exception.Panic p ->
+      Printf.printf "panic: %s\n" (Exception.panic_to_string p);
+      exit 1);
+  Printf.printf "status: %s\n" (VM.get_status vm);
+  let check name got expected =
+    Printf.printf "%s = %d  [expected %d]  %s\n" name got expected
+      (if got = expected then "PASS" else "FAIL")
   in
-  Instr.inspect all_instructions;
-
-  let filename = "_full_test.mapv" in
-
-  let serialized_bytes = Serializer.serialize_to_file filename prog_to_file in
-  Printf.printf "\nBinary Size: %d bytes\n" (Bytes.length serialized_bytes);
-
-  let prog_from_file = Serializer.deserialize_from_file filename in
-  Printf.printf "Read Function: %s\n\n" prog_from_file.funcs.(0).name;
-
-  Instr.inspect prog_from_file.funcs.(0).code;
-
-  let original_len = Array.length all_instructions in
-  let read_len = Array.length prog_from_file.funcs.(0).code in
-
-  if original_len <> read_len then
-    Printf.printf "\nFAIL: Instruction count mismatch (%d vs %d)\n" original_len
-      read_len
-  else Printf.printf "\nSUCCESS: Instruction count match (%d)\n" read_len
+  check "factorial(10)" (Value.to_int (VM.get_reg vm 5)) 3628800;
+  check "fibonacci(10)" (Value.to_int (VM.get_reg vm 6)) 55;
+  Trace.Serializer.serialize_to_file "_fiber_demo.mapvt" vm_ctx heap_ctx;
+  Printf.printf "trace written to _fiber_demo.mapvt\n";
+  Viz.Renderer.run "_fiber_demo.mapvt"

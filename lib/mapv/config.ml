@@ -22,7 +22,7 @@ module Heap = struct
 end
 
 module Gc = struct
-  type t = { major_threshold : int; major_growth_factor : float }
+  type t = { mutable major_threshold : int; major_growth_factor : float }
 
   let default = { major_threshold = 4096; major_growth_factor = 2.0 }
 
@@ -38,13 +38,13 @@ module Gc = struct
               "Config.Gc: major_growth_factor must be > 1.0"))
 end
 
-module Fiber = struct
-  type t = { max_fibers : int; call_depth : int }
+module Con = struct
+  type t = { max_cons : int; call_depth : int }
 
-  let default = { max_fibers = 1024; call_depth = 512 }
+  let default = { max_cons = 1024; call_depth = 512 }
 
   let validate t =
-    if t.max_fibers <= 0 then
+    if t.max_cons <= 0 then
       raise
         (Exception.Panic
            (Exception.Invalid_registry "Config.Fiber: max_fibers must be > 0"));
@@ -74,7 +74,7 @@ type t = {
   heap : Heap.t;
   gc : Gc.t;
   vm : Vm.t;
-  fiber : Fiber.t;
+  con : Con.t;
   registry : Exception.Registry.t;
 }
 
@@ -83,7 +83,7 @@ let default =
     heap = Heap.default;
     gc = Gc.default;
     vm = Vm.default;
-    fiber = Fiber.default;
+    con = Con.default;
     registry = Exception.Registry.empty;
   }
 
@@ -91,4 +91,4 @@ let validate t =
   Heap.validate t.heap;
   Gc.validate t.gc;
   Vm.validate t.vm;
-  Fiber.validate t.fiber
+  Con.validate t.con

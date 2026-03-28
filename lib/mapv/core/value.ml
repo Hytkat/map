@@ -21,7 +21,7 @@ let type_int = 2
 let type_float = 3
 let type_ptr = 4
 let type_fun = 5
-let bytecode_id : Instr.t array Type.Id.t = Type.Id.make ()
+let bytecode_id : bytes Type.Id.t = Type.Id.make ()
 
 let make_native : type a.
     tag:a Type.Id.t -> finalizer:(a -> unit) option -> a -> t =

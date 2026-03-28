@@ -9,7 +9,6 @@ bug-reports: "https://codeberg.org/debarchito/map/issues"
 depends: [
   "dune" {>= "3.22"}
   "ocaml" {>= "5.4.1"}
-  "bin_prot" {>= "0.17.0"}
   "raylib" {>= "1.6.0"}
   "odoc" {with-doc}
 ]
