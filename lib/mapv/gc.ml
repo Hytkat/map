@@ -3,7 +3,7 @@ open Core
 type trigger = Minor | Major
 
 module Make (H : Heap.S) = struct
-  let promote h ~promoted_count addr =
+  let promote h ~promoted_count ~promoted_addrs addr =
     let tag = H.get_tag h addr in
     if tag = Tag.forward then H.get_fwd h addr
     else begin
@@ -13,52 +13,65 @@ module Make (H : Heap.S) = struct
         H.write h dst i (H.read h addr i)
       done;
       H.set_fwd h addr dst;
-      H.on_promote h dst;
       incr promoted_count;
+      Queue.push dst promoted_addrs;
       dst
     end
 
-  let scan_object h ~promoted_count worklist addr =
+  let scan_object h ~promoted_count ~promoted_addrs worklist addr =
     let size = H.get_size h addr in
     for i = 0 to size - 1 do
       match H.read h addr i with
       | Value.Ptr child when H.is_young h child ->
-          let new_child = promote h ~promoted_count child in
+          let already_forwarded = H.get_tag h child = Tag.forward in
+          let new_child = promote h ~promoted_count ~promoted_addrs child in
           H.write h addr i (Value.Ptr new_child);
-          Queue.push new_child worklist
+          if not already_forwarded then Queue.push new_child worklist
       | _ -> ()
     done
 
-  let fix_roots h ~promoted_count worklist (roots : Value.t array array) =
+  let fix_roots h ~promoted_count ~promoted_addrs worklist
+      (roots : Value.t array array) =
     Array.iter
       (fun root_set ->
         for i = 0 to Array.length root_set - 1 do
           match root_set.(i) with
           | Value.Ptr addr when H.is_young h addr ->
-              let new_addr = promote h ~promoted_count addr in
+              let already_forwarded = H.get_tag h addr = Tag.forward in
+              let new_addr = promote h ~promoted_count ~promoted_addrs addr in
               root_set.(i) <- Value.Ptr new_addr;
-              Queue.push new_addr worklist
+              if not already_forwarded then Queue.push new_addr worklist
           | _ -> ()
         done)
       roots
 
-  let drain h ~promoted_count worklist =
+  let drain h ~promoted_count ~promoted_addrs worklist =
     while not (Queue.is_empty worklist) do
-      scan_object h ~promoted_count worklist (Queue.pop worklist)
+      scan_object h ~promoted_count ~promoted_addrs worklist
+        (Queue.pop worklist)
     done
 
   let minor h (cfg : Config.Gc.t) ~roots =
+    H.run_finalizers_young h;
     H.on_gc h Heap.Minor_start;
     let promoted_count = ref 0 in
+    let promoted_addrs = Queue.create () in
     let worklist = Queue.create () in
-    fix_roots h ~promoted_count worklist roots;
-    H.iter_dirty_old_chunks h (fun ci _chunk ->
+    fix_roots h ~promoted_count ~promoted_addrs worklist roots;
+    drain h ~promoted_count ~promoted_addrs worklist;
+    let dirty = ref [] in
+    H.iter_dirty_old_chunks h (fun ci _chunk -> dirty := ci :: !dirty);
+    List.iter
+      (fun ci ->
         H.iter_chunk_objects h ci (fun addr ->
-            scan_object h ~promoted_count worklist addr);
-        H.clear_card h ci);
-    drain h ~promoted_count worklist;
+            scan_object h ~promoted_count ~promoted_addrs worklist addr);
+        H.clear_card h ci)
+      !dirty;
+    drain h ~promoted_count ~promoted_addrs worklist;
+    let promoted = !promoted_count in
+    Queue.iter (fun dst -> H.on_promote h dst) promoted_addrs;
     H.reset_young h;
-    H.on_gc h (Heap.Minor_end { promoted = !promoted_count });
+    H.on_gc h (Heap.Minor_end { promoted });
     let s = H.stats h in
     if s.old_used >= cfg.major_threshold then Some Major else None
 
@@ -103,13 +116,11 @@ module Make (H : Heap.S) = struct
     H.on_gc h Heap.Major_end;
     let s = H.stats h in
     cfg.major_threshold <-
-      max cfg.major_threshold
+      max Config.Gc.default.major_threshold
         (int_of_float (float_of_int s.old_used *. cfg.major_growth_factor))
 
   let run h (cfg : Config.Gc.t) ~roots = function
-    | Minor ->
-        let trigger = minor h cfg ~roots in
-        trigger
+    | Minor -> minor h cfg ~roots
     | Major ->
         major h cfg ~roots;
         None

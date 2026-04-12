@@ -1,7 +1,7 @@
 open Core
 
 let magic = "MAPVT"
-let version = 1
+let version = 2
 let sec_vm = 0x00
 let sec_heap = 0x01
 let sec_gc = 0x02
@@ -11,13 +11,6 @@ module Write = struct
   let u16 buf v = Buffer.add_uint16_le buf v
   let u32 buf v = Buffer.add_int32_le buf (Int32.of_int v)
   let u64 buf v = Buffer.add_int64_le buf v
-
-  let align buf n =
-    let r = Buffer.length buf mod n in
-    if r <> 0 then
-      for _ = 1 to n - r do
-        Buffer.add_char buf '\x00'
-      done
 
   let value buf = function
     | Value.Nil -> u8 buf 0
@@ -96,14 +89,16 @@ module Write = struct
       con_news;
     u32 buf (List.length con_yields);
     List.iter
-      (fun (tick, pc) ->
+      (fun (tick, con_id, pc) ->
         u32 buf tick;
+        u32 buf con_id;
         u32 buf pc)
       con_yields;
     u32 buf (List.length con_resumes);
     List.iter
-      (fun (tick, pc) ->
+      (fun (tick, con_id, pc) ->
         u32 buf tick;
+        u32 buf con_id;
         u32 buf pc)
       con_resumes;
     u32 buf (List.length reg_writes);
@@ -171,10 +166,6 @@ module Write = struct
     buf
 
   let program vm_ctx heap_ctx =
-    let out = Buffer.create 4096 in
-    Buffer.add_string out magic;
-    u16 out version;
-    u8 out 0;
     let secs =
       [|
         (sec_vm, vm_section vm_ctx);
@@ -183,9 +174,9 @@ module Write = struct
       |]
     in
     let n_secs = Array.length secs in
-    u32 out n_secs;
-    let table_start = 5 + 2 + 1 + 4 in
-    let body_start = table_start + (n_secs * 12) in
+    let header_size = 5 + 2 + 1 in
+    let table_size = 4 + (n_secs * 12) in
+    let body_start = header_size + table_size in
     let offsets = Array.make n_secs 0 in
     let pos = ref body_start in
     Array.iteri
@@ -194,6 +185,11 @@ module Write = struct
         offsets.(i) <- !pos + padding;
         pos := offsets.(i) + Buffer.length b)
       secs;
+    let out = Buffer.create 4096 in
+    Buffer.add_string out magic;
+    u16 out version;
+    u8 out 0;
+    u32 out n_secs;
     Array.iteri
       (fun i (id, b) ->
         u32 out id;
@@ -202,25 +198,15 @@ module Write = struct
       secs;
     Array.iteri
       (fun i (_, b) ->
-        let current =
-          table_start + (n_secs * 12)
-          + Array.fold_left
-              (fun acc j ->
-                if j < i then
-                  acc
-                  + ((8 - ((table_start + (n_secs * 12) + acc) mod 8)) mod 8)
-                  + Buffer.length (snd secs.(j))
-                else acc)
-              0
-              (Array.init i (fun j -> j))
-        in
-        ignore current;
-        let padding = (8 - (Buffer.length out mod 8)) mod 8 in
+        let current_pos = Buffer.length out in
+        let padding = (8 - (current_pos mod 8)) mod 8 in
+        assert (Buffer.length out + padding = offsets.(i));
         for _ = 1 to padding do
           Buffer.add_char out '\x00'
         done;
         Buffer.add_buffer out b)
       secs;
+    ignore offsets;
     out
 end
 
@@ -267,8 +253,8 @@ module Read = struct
     rets : (int * int) array;
     throws : (int * int) array;
     con_news : (int * int) array;
-    con_yields : (int * int) array;
-    con_resumes : (int * int) array;
+    con_yields : (int * int * int) array;
+    con_resumes : (int * int * int) array;
     reg_writes : (int * int * Value.t) array;
   }
 
@@ -326,15 +312,17 @@ module Read = struct
     let con_yields =
       Array.init n_con_yields (fun _ ->
           let tick = u32 cur in
+          let con_id = u32 cur in
           let pc = u32 cur in
-          (tick, pc))
+          (tick, con_id, pc))
     in
     let n_con_resumes = u32 cur in
     let con_resumes =
       Array.init n_con_resumes (fun _ ->
           let tick = u32 cur in
+          let con_id = u32 cur in
           let pc = u32 cur in
-          (tick, pc))
+          (tick, con_id, pc))
     in
     let n_reg_writes = u32 cur in
     let reg_writes =
@@ -443,7 +431,9 @@ module Read = struct
           (id, off, sz))
     in
     let get_sec id =
-      Array.find_map (fun (i, o, _) -> if i = id then Some o else None) secs
+      List.find_map
+        (fun (i, o, _) -> if i = id then Some o else None)
+        (Array.to_list secs)
     in
     let require id name =
       match get_sec id with

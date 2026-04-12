@@ -16,49 +16,90 @@ type highlight = {
   mutable age : float;
 }
 
+type inspector = { mutable active : bool; mutable addr : int }
+type scroll = { mutable offset : int }
+
 type state = {
   trace : Trace.Serializer.Read.t;
   pb : playback;
   hl : highlight;
+  insp : inspector;
+  reg_scroll : scroll;
+  stack_scroll : scroll;
+  heap_scroll : scroll;
+  con_scroll : scroll;
   mutable mode : view_mode;
-  mutable show_settings : bool;
   total_ticks : int;
 }
 
 let screen_w = 1920
 let screen_h = 1080
-let scale = 1.25
+let scale = 1.75
 let sw = int_of_float (float_of_int screen_w /. scale)
 let sh = int_of_float (float_of_int screen_h /. scale)
-let col_bg = Color.create 15 15 20 255
-let col_panel = Color.create 22 22 30 255
-let col_border = Color.create 45 45 60 255
-let col_text = Color.create 210 210 220 255
-let col_dim = Color.create 90 90 110 255
-let col_accent = Color.create 100 180 255 255
-let col_green = Color.create 80 220 120 255
-let col_red = Color.create 220 80 80 255
-let col_yellow = Color.create 220 200 80 255
-let col_young = Color.create 60 120 200 255
-let col_old = Color.create 180 80 180 255
-let col_free = Color.create 30 30 40 255
-let col_scrubber = Color.create 50 50 70 255
-let col_thumb = Color.create 100 180 255 255
-let col_fiber_run = Color.create 80 220 120 255
-let col_fiber_sus = Color.create 220 200 80 255
-let col_fiber_dead = Color.create 90 90 110 255
-let col_highlight = Color.create 255 220 100 255
-let font_size_sm = 16
-let font_size_md = 18
-let font_size_lg = 24
-let pad = 14
-let bar_h = 52
-let ctrl_h = 64
-let instr_h = 56
+let bar_h = 36
+let instr_h = 52
+let event_h = 22
+let ctrl_h = 52
+let pad = 12
+let row_h = 22
+let fxs = 11
+let fsm = 14
+let fmd = 18
+let flg = 22
 let s x = int_of_float (float_of_int x *. scale)
+let c r g b = Color.create r g b 255
+let col_bg = c 11 12 17
+let col_panel = c 16 18 26
+let col_panel2 = c 20 22 32
+let col_border = c 38 42 58
+let col_border2 = c 55 60 82
+let col_text = c 210 212 228
+let col_dim = c 82 88 112
+let col_dim2 = c 46 50 68
+let col_accent = c 90 170 255
+let col_green = c 68 210 110
+let col_red = c 220 72 72
+let col_yellow = c 230 200 60
+let col_orange = c 240 150 55
+let col_purple = c 170 120 255
+let col_teal = c 72 205 195
+let col_young = c 55 120 210
+let col_old = c 160 72 205
+let col_recent = c 255 210 70
+let col_scrubber = c 30 34 48
+let col_thumb = c 90 170 255
 
-let op_name op =
-  match op with
+let lerp_color a b t =
+  let f x y =
+    int_of_float (float_of_int x +. ((float_of_int y -. float_of_int x) *. t))
+  in
+  c
+    (f (Color.r a) (Color.r b))
+    (f (Color.g a) (Color.g b))
+    (f (Color.b a) (Color.b b))
+
+let clamp_str str n =
+  if String.length str <= n then str else String.sub str 0 (n - 1) ^ "…"
+
+let draw_txt x y sz col str = draw_text str (s x) (s y) (s sz) col
+let draw_rect x y w h col = draw_rectangle (s x) (s y) (s w) (s h) col
+let draw_rect_l x y w h col = draw_rectangle_lines (s x) (s y) (s w) (s h) col
+let draw_circ x y r col = draw_circle (s x) (s y) (float_of_int (s r)) col
+
+let panel x y w h =
+  draw_rect x y w h col_panel;
+  draw_rect_l x y w h col_border
+
+let panel2 x y w h =
+  draw_rect x y w h col_panel2;
+  draw_rect_l x y w h col_border2
+
+let section_hdr x y w lbl =
+  draw_txt x y fxs col_dim lbl;
+  draw_rect x (y + fxs + 3) w 1 col_border2
+
+let op_name = function
   | 0x00 -> "Nop"
   | 0x01 -> "Halt"
   | 0x02 -> "Mov"
@@ -122,431 +163,652 @@ let op_name op =
   | 0x91 -> "ConYield"
   | 0x92 -> "ConResume"
   | 0x93 -> "ConStatus"
-  | _ -> Printf.sprintf "0x%02X" op
+  | op -> Printf.sprintf "op_%02X" op
 
-let value_to_string v =
-  match v with
+let op_col = function
+  | 0x00 | 0x01 -> col_dim
+  | op when op >= 0x02 && op <= 0x08 -> col_accent
+  | op when op >= 0x10 && op <= 0x1B -> col_green
+  | op when op >= 0x20 && op <= 0x28 -> col_purple
+  | op when op >= 0x30 && op <= 0x39 -> col_teal
+  | 0x40 | 0x41 | 0x42 -> col_orange
+  | op when op >= 0x50 && op <= 0x54 -> col_old
+  | op when op >= 0x60 && op <= 0x62 -> c 205 110 110
+  | op when op >= 0x70 && op <= 0x74 -> col_green
+  | op when op >= 0x80 && op <= 0x82 -> col_red
+  | op when op >= 0x90 && op <= 0x93 -> col_teal
+  | _ -> col_dim
+
+let value_str = function
   | Value.Nil -> "nil"
   | Value.Bool b -> if b then "true" else "false"
   | Value.Int n -> string_of_int n
-  | Value.Float f -> Printf.sprintf "%.6g" f
+  | Value.Float f -> Printf.sprintf "%.5g" f
   | Value.Ptr p -> Printf.sprintf "ptr(%d)" p
-  | Value.NativeFun _ -> "<fun>"
-  | Value.NativePtr _ -> "<native>"
+  | Value.NativeFun _ -> "<native-fn>"
+  | Value.NativePtr _ -> "<native-ptr>"
 
-let reg_value_at trace tick reg =
-  let writes = trace.Trace.Serializer.Read.vm.reg_writes in
+let value_col = function
+  | Value.Nil -> col_dim
+  | Value.Bool _ -> col_teal
+  | Value.Int _ -> col_text
+  | Value.Float _ -> col_orange
+  | Value.Ptr _ -> col_accent
+  | Value.NativeFun _ | Value.NativePtr _ -> col_purple
+
+let tvm s = s.trace.Trace.Serializer.Read.vm
+let tgc s = s.trace.Trace.Serializer.Read.gc
+let thp s = s.trace.Trace.Serializer.Read.heap
+
+let reg_value_at state tick reg =
   let last = ref None in
   Array.iter
     (fun (t, r, v) -> if t <= tick && r = reg then last := Some v)
-    writes;
+    (tvm state).reg_writes;
   !last
 
-let reg_last_written_at trace tick reg =
-  let writes = trace.Trace.Serializer.Read.vm.reg_writes in
-  let last_tick = ref (-1) in
+let reg_last_tick state tick reg =
+  let lt = ref (-1) in
   Array.iter
-    (fun (t, r, _) -> if t <= tick && r = reg then last_tick := t)
-    writes;
-  !last_tick
+    (fun (t, r, _) -> if t <= tick && r = reg then lt := t)
+    (tvm state).reg_writes;
+  !lt
 
-let allocs_at trace tick =
-  Array.to_seq trace.Trace.Serializer.Read.heap.allocs
-  |> Seq.filter (fun (t, _, _, _) -> t <= tick)
-  |> List.of_seq
+let active_regs state tick =
+  let tbl = Hashtbl.create 64 in
+  Array.iter
+    (fun (t, r, _) -> if t <= tick then Hashtbl.replace tbl r ())
+    (tvm state).reg_writes;
+  tbl
 
-let frees_at trace tick =
-  Array.to_seq trace.Trace.Serializer.Read.heap.frees
-  |> Seq.filter (fun (t, _) -> t <= tick)
-  |> Seq.map snd |> List.of_seq
-
-let calls_at trace tick =
-  Array.to_seq trace.Trace.Serializer.Read.vm.calls
-  |> Seq.filter (fun (t, _, _) -> t <= tick)
-  |> List.of_seq
-
-let rets_at trace tick =
-  Array.to_seq trace.Trace.Serializer.Read.vm.rets
-  |> Seq.filter (fun (t, _) -> t <= tick)
-  |> List.of_seq
-
-let con_events_at trace tick =
-  let news =
-    Array.to_seq trace.Trace.Serializer.Read.vm.con_news
-    |> Seq.filter (fun (t, _) -> t <= tick)
-    |> List.of_seq
-  in
-  let yields =
-    Array.to_seq trace.Trace.Serializer.Read.vm.con_yields
-    |> Seq.filter (fun (t, _) -> t <= tick)
-    |> List.of_seq
-  in
-  let resumes =
-    Array.to_seq trace.Trace.Serializer.Read.vm.con_resumes
-    |> Seq.filter (fun (t, _) -> t <= tick)
-    |> List.of_seq
-  in
-  (news, yields, resumes)
-
-let current_instr trace tick =
-  let instrs = trace.Trace.Serializer.Read.vm.instrs in
+let current_instr state tick =
   let last = ref None in
   Array.iter
     (fun (t, pc, op) -> if t <= tick then last := Some (t, pc, op))
-    instrs;
+    (tvm state).instrs;
   !last
 
-let draw_panel x y w h =
-  draw_rectangle (s x) (s y) (s w) (s h) col_panel;
-  draw_rectangle_lines (s x) (s y) (s w) (s h) col_border
+let writes_at_tick state tick =
+  Array.to_list (tvm state).reg_writes
+  |> List.filter (fun (t, _, _) -> t = tick)
 
-let draw_label x y text col = draw_text text (s x) (s y) (s font_size_sm) col
+let calls_at state tick =
+  Array.to_list (tvm state).calls |> List.filter (fun (t, _, _) -> t <= tick)
 
-let draw_section_title x y text =
-  draw_text text (s x) (s y) (s font_size_md) col_accent
+let rets_at state tick =
+  Array.to_list (tvm state).rets |> List.filter (fun (t, _) -> t <= tick)
 
-let lerp_color a b t =
-  let f x y =
-    int_of_float (float_of_int x +. ((float_of_int y -. float_of_int x) *. t))
-  in
-  let r = f (Color.r a) (Color.r b) in
-  let g = f (Color.g a) (Color.g b) in
-  let bl = f (Color.b a) (Color.b b) in
-  Color.create r g bl 255
+let allocs_at state tick =
+  Array.to_list (thp state).allocs
+  |> List.filter (fun (t, _, _, _) -> t <= tick)
 
-let active_regs_at trace tick =
-  let writes = trace.Trace.Serializer.Read.vm.reg_writes in
-  let seen = Hashtbl.create 32 in
+let frees_at state tick =
+  Array.to_list (thp state).frees
+  |> List.filter (fun (t, _) -> t <= tick)
+  |> List.map snd
+
+let promotes_at state tick =
+  Array.to_list (thp state).promotes
+  |> List.filter (fun (t, _) -> t <= tick)
+  |> List.map snd
+
+let gc_events_at state tick =
+  Array.to_list (tgc state).events |> List.filter (fun (t, _) -> t <= tick)
+
+let gc_minor_count state tick =
+  List.fold_left
+    (fun a (_, ev) -> match ev with Heap.Minor_end _ -> a + 1 | _ -> a)
+    0 (gc_events_at state tick)
+
+let gc_major_count state tick =
+  List.fold_left
+    (fun a (_, ev) -> match ev with Heap.Major_end -> a + 1 | _ -> a)
+    0 (gc_events_at state tick)
+
+let gc_promoted_total state tick =
+  List.fold_left
+    (fun a (_, ev) ->
+      match ev with Heap.Minor_end { promoted } -> a + promoted | _ -> a)
+    0 (gc_events_at state tick)
+
+let gc_freed_total state tick =
+  List.fold_left
+    (fun a (_, ev) ->
+      match ev with Heap.Major_sweep { freed; _ } -> a + freed | _ -> a)
+    0 (gc_events_at state tick)
+
+let in_gc state tick =
+  let r = ref false in
   Array.iter
-    (fun (t, r, _) -> if t <= tick then Hashtbl.replace seen r ())
-    writes;
-  seen
+    (fun (t, ev) ->
+      if t <= tick then
+        match ev with
+        | Heap.Minor_start | Heap.Major_mark _ -> r := true
+        | Heap.Minor_end _ | Heap.Major_end -> r := false
+        | _ -> ())
+    (tgc state).events;
+  !r
+
+let gen_split state tick =
+  let allocs = allocs_at state tick in
+  let promoted = promotes_at state tick in
+  let old_set = Hashtbl.create 16 in
+  List.iter (fun addr -> Hashtbl.replace old_set addr ()) promoted;
+  let young =
+    List.filter (fun (_, a, _, _) -> not (Hashtbl.mem old_set a)) allocs
+  in
+  let old = List.filter (fun (_, a, _, _) -> Hashtbl.mem old_set a) allocs in
+  (young, old)
+
+let continuations_at state tick =
+  let con_news =
+    Array.to_list (tvm state).con_news |> List.filter (fun (t, _) -> t <= tick)
+  in
+  let n_cons = List.length con_news in
+  Array.to_list
+    (Array.init n_cons (fun idx ->
+         let birth_tick, _birth_pc = List.nth con_news idx in
+         let yields =
+           Array.to_list (tvm state).con_yields
+           |> List.filter (fun (t, cid, _) -> t <= tick && cid = idx)
+         in
+         let resumes =
+           Array.to_list (tvm state).con_resumes
+           |> List.filter (fun (t, cid, _) -> t <= tick && cid = idx)
+         in
+         let last_yield =
+           List.fold_left (fun a (t, _, _) -> max a t) (-1) yields
+         in
+         let last_resume =
+           List.fold_left (fun a (t, _, _) -> max a t) (-1) resumes
+         in
+         let status =
+           if last_resume > last_yield && last_resume >= 0 then `Running
+           else if last_yield >= 0 then `Suspended
+           else `New
+         in
+         (idx, birth_tick, status, List.length yields, List.length resumes)))
+
+let call_depth state tick =
+  let calls = calls_at state tick in
+  let rets = rets_at state tick in
+  max 0 (List.length calls - List.length rets)
+
+let active_call_frames state tick =
+  let calls = calls_at state tick in
+  let depth = call_depth state tick in
+  let n = List.length calls in
+  let start = max 0 (n - depth) in
+  let arr = Array.of_list calls in
+  Array.to_list (Array.sub arr start (n - start))
+
+let fill_bar x y w h used total col_fill =
+  draw_rect x y w h col_scrubber;
+  let pct =
+    if total <= 0 then 0.0
+    else Float.min 1.0 (float_of_int used /. float_of_int total)
+  in
+  let fw = int_of_float (pct *. float_of_int w) in
+  if fw > 0 then draw_rect x y fw h col_fill;
+  pct
+
+let rows_visible body_y body_h = (body_y, body_y + body_h)
 
 let draw_registers state x y w h =
-  draw_panel x y w h;
-  draw_section_title (x + pad) (y + pad) "REGISTERS";
-  let row_h = 24 in
-  let header_h = (pad * 2) + font_size_md in
-  let avail_h = h - header_h in
-  let max_rows = avail_h / row_h in
-  let visible = min 32 max_rows in
-  let active = active_regs_at state.trace state.pb.tick in
-  for i = 0 to visible - 1 do
-    let ry = y + header_h + (i * row_h) in
-    let last_t = reg_last_written_at state.trace state.pb.tick i in
-    let recently_written = last_t >= 0 && state.pb.tick - last_t <= 3 in
-    let is_hl = state.hl.reg = Some i in
-    let has_value = Hashtbl.mem active i in
-    let bg =
-      if is_hl then lerp_color col_accent col_panel (1.0 -. state.hl.age)
-      else if recently_written then
-        lerp_color col_highlight col_panel
-          (float_of_int (state.pb.tick - last_t) /. 3.0)
-      else if has_value then Color.create 28 28 38 255
-      else col_panel
-    in
-    draw_rectangle (s (x + pad)) (s ry) (s (w - (pad * 2))) (s (row_h - 2)) bg;
-    let label = Printf.sprintf "r%-2d" i in
-    let label_col = if has_value then col_dim else Color.create 50 50 65 255 in
-    draw_text label (s (x + pad + 4)) (s (ry + 4)) (s font_size_sm) label_col;
-    let val_str =
-      match reg_value_at state.trace state.pb.tick i with
-      | None -> "-"
-      | Some v -> value_to_string v
-    in
-    let val_col =
-      if recently_written then col_highlight
-      else if has_value then col_text
-      else col_dim
-    in
-    draw_text val_str (s (x + pad + 52)) (s (ry + 4)) (s font_size_sm) val_col
-  done;
-  let call_y = y + header_h + (visible * row_h) + pad in
-  if call_y + 80 < y + h then begin
-    draw_rectangle (s (x + pad)) (s call_y) (s (w - (pad * 2))) 1 col_border;
-    let call_y = call_y + pad in
-    draw_section_title (x + pad) call_y "CALL STACK";
-    let calls = calls_at state.trace state.pb.tick in
-    let rets = rets_at state.trace state.pb.tick in
-    let depth = List.length calls - List.length rets in
-    let depth = max 0 depth in
-    let active_calls =
-      let all = Array.of_list calls in
-      let n = Array.length all in
-      let start = max 0 (n - depth) in
-      Array.to_list (Array.sub all start (n - start))
-    in
-    let n = List.length active_calls in
-    if n = 0 then
-      draw_text "  (empty)"
-        (s (x + pad + 4))
-        (s (call_y + font_size_md + pad))
-        (s font_size_sm) col_dim
-    else
-      List.iteri
-        (fun i (_, pc, target) ->
-          let cy = call_y + font_size_md + pad + (i * 26) in
-          if cy < y + h - pad then begin
-            let is_top = i = n - 1 in
-            let frame_col =
-              if is_top then col_accent else Color.create 40 50 70 255
-            in
-            draw_rectangle
-              (s (x + pad))
-              (s cy)
-              (s (w - (pad * 2)))
-              (s 22) frame_col;
-            let depth_str = Printf.sprintf "#%d" i in
-            draw_text depth_str
-              (s (x + pad + 4))
-              (s (cy + 3))
-              (s font_size_sm)
-              (if is_top then col_bg else col_dim);
-            let s_str = Printf.sprintf "pc=%d -> %d" pc target in
-            draw_text s_str
-              (s (x + pad + 36))
-              (s (cy + 3))
-              (s font_size_sm)
-              (if is_top then col_bg else col_text)
-          end)
-        active_calls
+  panel x y w h;
+  let active = active_regs state state.pb.tick in
+  let sparse =
+    let acc = ref [] in
+    for i = 255 downto 0 do
+      if Hashtbl.mem active i then acc := i :: !acc
+    done;
+    !acc
+  in
+  let n_live = List.length sparse in
+  let hdr_h = pad + fmd + 6 in
+  draw_txt (x + pad) (y + pad) fmd col_accent "REGISTERS";
+  draw_txt
+    (x + w - pad - 80)
+    (y + pad + 2)
+    fxs col_dim
+    (Printf.sprintf "%d live" n_live);
+  draw_rect x (y + hdr_h) w 1 col_border;
+  let body_y = y + hdr_h + 1 in
+  let body_h = h - hdr_h - 1 in
+  let clip0, clip1 = rows_visible body_y body_h in
+  if n_live = 0 then
+    draw_txt
+      (x + pad + 6)
+      (body_y + 6) fsm col_dim2 "(no registers written yet)"
+  else begin
+    let visible_start = state.reg_scroll.offset in
+    let max_visible = (body_h / row_h) + 2 in
+    let slice = Array.of_list sparse in
+    for i = visible_start to min (n_live - 1) (visible_start + max_visible) do
+      let reg = slice.(i) in
+      let ry = body_y + ((i - visible_start) * row_h) in
+      if ry + row_h > clip0 && ry < clip1 then begin
+        let lt = reg_last_tick state state.pb.tick reg in
+        let age = state.pb.tick - lt in
+        let recent = lt >= 0 && age <= 6 in
+        let is_hl = state.hl.reg = Some reg in
+        let bg =
+          if is_hl then lerp_color col_accent col_panel (1.0 -. state.hl.age)
+          else if recent then
+            lerp_color (c 58 48 16) col_panel (float_of_int age /. 6.0)
+          else c 20 22 32
+        in
+        draw_rect (x + 1) ry (w - 2) (row_h - 1) bg;
+        draw_rect (x + 1) ry 3 (row_h - 1)
+          (if recent then col_recent else col_dim2);
+        draw_txt (x + 7) (ry + 4) fxs
+          (if recent then col_recent else col_dim)
+          (Printf.sprintf "r%-3d" reg);
+        let v =
+          Option.value (reg_value_at state state.pb.tick reg) ~default:Value.Nil
+        in
+        let vcol = if recent then col_recent else value_col v in
+        draw_txt (x + 54) (ry + 4) fxs vcol (clamp_str (value_str v) 28);
+        let age_str = if lt < 0 then "" else Printf.sprintf "+%d" age in
+        draw_txt (x + w - pad - 28) (ry + 4) fxs col_dim2 age_str
+      end
+    done
+  end
+
+let draw_call_stack state x y w h =
+  draw_rect x y w h (c 14 16 22);
+  draw_rect_l x y w h col_border;
+  let hdr_h = pad + fxs + 6 in
+  section_hdr (x + pad) (y + pad) (w - (pad * 2)) "CALL STACK";
+  draw_rect x (y + hdr_h) w 1 col_border;
+  let frames = active_call_frames state state.pb.tick in
+  let n_frames = List.length frames in
+  let depth = call_depth state state.pb.tick in
+  draw_txt (x + w - pad - 28) (y + pad) fxs col_dim (string_of_int depth);
+  let body_y = y + hdr_h + 1 in
+  let body_h = h - hdr_h - 1 in
+  let clip0, clip1 = rows_visible body_y body_h in
+  if n_frames = 0 then
+    draw_txt (x + pad + 4) (body_y + 6) fsm col_dim2 "(empty)"
+  else begin
+    let visible_start = state.stack_scroll.offset in
+    let max_visible = (body_h / row_h) + 2 in
+    let arr = Array.of_list frames in
+    for i = visible_start to min (n_frames - 1) (visible_start + max_visible) do
+      let ry = body_y + ((i - visible_start) * row_h) in
+      if ry + row_h > clip0 && ry < clip1 then begin
+        let _, src, dst = arr.(i) in
+        let is_top = i = n_frames - 1 in
+        let bg = if is_top then col_accent else c 26 30 44 in
+        draw_rect (x + 1) ry (w - 2) (row_h - 1) bg;
+        let tc = if is_top then col_bg else col_dim in
+        let vc = if is_top then col_bg else col_text in
+        draw_txt (x + 6) (ry + 4) fxs tc (Printf.sprintf "#%d" i);
+        draw_txt (x + 28) (ry + 4) fxs vc
+          (Printf.sprintf "pc %-5d  ->r%-5d" src dst)
+      end
+    done
+  end
+
+let draw_continuations state x y w h =
+  draw_rect x y w h (c 14 16 22);
+  draw_rect_l x y w h col_border;
+  let hdr_h = pad + fxs + 6 in
+  let cons = continuations_at state state.pb.tick in
+  let n_cons = List.length cons in
+  section_hdr (x + pad) (y + pad) (w - (pad * 2)) "CONTINUATIONS";
+  draw_txt (x + w - pad - 28) (y + pad) fxs col_dim (string_of_int n_cons);
+  draw_rect x (y + hdr_h) w 1 col_border;
+  let body_y = y + hdr_h + 1 in
+  let body_h = h - hdr_h - 1 in
+  let clip0, clip1 = rows_visible body_y body_h in
+  if n_cons = 0 then draw_txt (x + pad + 4) (body_y + 6) fsm col_dim2 "(none)"
+  else begin
+    let visible_start = state.con_scroll.offset in
+    let max_visible = (body_h / row_h) + 2 in
+    let arr = Array.of_list cons in
+    for i = visible_start to min (n_cons - 1) (visible_start + max_visible) do
+      let ry = body_y + ((i - visible_start) * row_h) in
+      if ry + row_h > clip0 && ry < clip1 then begin
+        let idx, birth, status, yields, resumes = arr.(i) in
+        let sc, ss =
+          match status with
+          | `Running -> (col_green, "running")
+          | `Suspended -> (col_yellow, "suspended")
+          | `New -> (col_dim, "new")
+        in
+        let is_running = status = `Running in
+        let bg = if is_running then c 14 26 18 else c 20 22 32 in
+        draw_rect (x + 1) ry (w - 2) (row_h - 1) bg;
+        draw_rect (x + 1) ry 3 (row_h - 1) sc;
+        draw_circ (x + 10) (ry + (row_h / 2) - 1) 3 sc;
+        draw_txt (x + 18) (ry + 4) fxs col_text (Printf.sprintf "con_%d" idx);
+        draw_txt (x + 52) (ry + 4) fxs col_dim (Printf.sprintf "t=%d" birth);
+        draw_txt (x + 90) (ry + 4) fxs sc ss;
+        draw_txt
+          (x + w - pad - 60)
+          (ry + 4) fxs col_dim2
+          (Printf.sprintf "y%d r%d" yields resumes)
+      end
+    done
   end
 
 let draw_heap state x y w h =
-  draw_panel x y w h;
-  draw_section_title (x + pad) (y + pad) "HEAP";
-  let allocs = allocs_at state.trace state.pb.tick in
-  let freed = frees_at state.trace state.pb.tick in
-  let cell_sz = 16 in
-  let cell_gap = 3 in
-  let cols = (w - (pad * 2)) / (cell_sz + cell_gap) in
-  let header_h = (pad * 2) + font_size_md in
-  let young_label_y = y + header_h in
-  draw_label (x + pad) young_label_y "YOUNG GEN" col_dim;
-  let young_cells_y = young_label_y + font_size_sm + 6 in
-  let young_allocs = List.filter (fun (_, _, _, tag) -> tag < 10) allocs in
-  let old_allocs = List.filter (fun (_, _, _, tag) -> tag >= 10) allocs in
-  let rows_for cells =
-    let n = List.length cells in
-    max 1 ((n + cols - 1) / cols)
+  panel x y w h;
+  let iw = w - (pad * 2) in
+  let cy = ref (y + pad) in
+  draw_txt (x + pad) !cy fmd col_accent "HEAP";
+  cy := !cy + fmd + 8;
+  draw_rect (x + pad) !cy iw 1 col_border;
+  cy := !cy + 6;
+  let freed_addrs = frees_at state state.pb.tick in
+  let young, old = gen_split state state.pb.tick in
+  let n_young = List.length young in
+  let n_old = List.length old in
+  let n_freed = List.length freed_addrs in
+  let n_total = n_young + n_old + n_freed in
+  let b_young = List.fold_left (fun a (_, _, sz, _) -> a + sz) 0 young in
+  let b_old = List.fold_left (fun a (_, _, sz, _) -> a + sz) 0 old in
+  section_hdr (x + pad) !cy iw "MEMORY";
+  cy := !cy + fxs + 8;
+  let bar_row lbl n b col_fill =
+    draw_txt (x + pad) !cy fxs col_dim lbl;
+    let stats_str = Printf.sprintf "%d obj | %dw" n b in
+    draw_txt (x + iw - pad - 100) !cy fxs col_dim stats_str;
+    cy := !cy + fxs + 4;
+    let bar_w = iw - pad - 60 in
+    let pct = fill_bar (x + pad) !cy bar_w 10 n (max 1 n_total) col_fill in
+    let pct_str = Printf.sprintf "%3d%%" (int_of_float (pct *. 100.0)) in
+    draw_txt (x + pad + bar_w + 8) (!cy - 1) fxs col_dim pct_str;
+    cy := !cy + 24
   in
-  let young_rows = min 4 (rows_for young_allocs) in
-  let draw_cells cells base_y is_young max_rows =
+  bar_row "young" n_young b_young col_young;
+  bar_row "old" n_old b_old col_old;
+  bar_row "freed" n_freed 0 col_dim2;
+  cy := !cy + 4;
+  let sw4 = iw / 4 in
+  let stats =
+    [|
+      ("total", Printf.sprintf "%dw" (b_young + b_old), col_text);
+      ("live", string_of_int (n_young + n_old), col_green);
+      ( "promo",
+        string_of_int (List.length (promotes_at state state.pb.tick)),
+        col_purple );
+      ( "frag",
+        (if n_total = 0 then "n/a"
+         else
+           Printf.sprintf "%.0f%%"
+             (100.0 *. float_of_int n_freed /. float_of_int n_total)),
+        col_yellow );
+    |]
+  in
+  Array.iteri
+    (fun i (k, v, vc) ->
+      let sx = x + pad + (i * sw4) in
+      draw_txt sx !cy fxs col_dim k;
+      draw_txt sx (!cy + fxs + 3) fsm vc v)
+    stats;
+  cy := !cy + fxs + fsm + 10;
+  draw_rect (x + pad) !cy iw 1 col_border;
+  cy := !cy + 6;
+  section_hdr (x + pad) !cy iw "GC";
+  cy := !cy + fxs + 8;
+  if in_gc state state.pb.tick then begin
+    draw_rect (x + pad) !cy iw (fsm + 6) (c 50 18 18);
+    draw_txt (x + pad + 6) (!cy + 3) fsm col_red "GC IN PROGRESS";
+    cy := !cy + fsm + 10
+  end;
+  let gc_rows =
+    [|
+      ("minor runs", gc_minor_count state state.pb.tick, col_young);
+      ("major runs", gc_major_count state state.pb.tick, col_old);
+      ("objs promo", gc_promoted_total state state.pb.tick, col_purple);
+      ("objs swept", gc_freed_total state state.pb.tick, col_dim);
+    |]
+  in
+  let col2 = iw / 2 in
+  Array.iteri
+    (fun i (k, v, vc) ->
+      let sx = x + pad + (i mod 2 * col2) in
+      let sy = !cy + (i / 2 * (fxs + fsm + 8)) in
+      draw_txt sx sy fxs col_dim k;
+      draw_txt sx (sy + fxs + 3) fsm vc (string_of_int v))
+    gc_rows;
+  cy := !cy + (2 * (fxs + fsm + 8)) + 6;
+  draw_rect (x + pad) !cy iw 1 col_border;
+  cy := !cy + 6;
+  section_hdr (x + pad) !cy iw "ALLOCATION MAP";
+  cy := !cy + fxs + 8;
+  let cell = 12 and gap = 2 in
+  let cols_n = iw / (cell + gap) in
+  let freed_set = Hashtbl.create 16 in
+  List.iter (fun a -> Hashtbl.replace freed_set a ()) freed_addrs;
+  let promoted_set = Hashtbl.create 16 in
+  List.iter
+    (fun a -> Hashtbl.replace promoted_set a ())
+    (promotes_at state state.pb.tick);
+  let draw_cells cells max_rows =
     List.iteri
-      (fun i (_, addr, size, _tag) ->
-        let row = i / cols in
-        let col = i mod cols in
+      (fun i (_, addr, size, _) ->
+        let row = i / cols_n and col2 = i mod cols_n in
         if row < max_rows then begin
-          let cx = x + pad + (col * (cell_sz + cell_gap)) in
-          let cy = base_y + (row * (cell_sz + cell_gap)) in
-          let is_freed = List.mem addr freed in
-          let color =
-            if is_freed then col_free
-            else if is_young then col_young
-            else col_old
+          let cx = x + pad + (col2 * (cell + gap)) in
+          let cy2 = !cy + (row * (cell + gap)) in
+          let is_freed = Hashtbl.mem freed_set addr in
+          let is_old = Hashtbl.mem promoted_set addr && not is_freed in
+          let bc =
+            if is_freed then c 20 22 32
+            else if is_old then col_old
+            else col_young
           in
-          draw_rectangle (s cx) (s cy) (s cell_sz) (s cell_sz) color;
-          if size > 1 then
-            draw_rectangle
-              (s (cx + 3))
-              (s (cy + 3))
-              (s (cell_sz - 6))
-              (s (cell_sz - 6))
-              (lerp_color color col_bg 0.5)
+          draw_rect cx cy2 cell cell bc;
+          if size > 1 && not is_freed then
+            draw_rect (cx + 3) (cy2 + 3) (cell - 6) (cell - 6)
+              (lerp_color bc col_bg 0.4)
         end)
       cells
   in
-  draw_cells young_allocs young_cells_y true young_rows;
-  let old_label_y = young_cells_y + (young_rows * (cell_sz + cell_gap)) + pad in
-  draw_label (x + pad) old_label_y "OLD GEN" col_dim;
-  let old_cells_y = old_label_y + font_size_sm + 6 in
-  let old_rows = min 4 (rows_for old_allocs) in
-  draw_cells old_allocs old_cells_y false old_rows;
-  let stats_y = old_cells_y + (old_rows * (cell_sz + cell_gap)) + pad in
-  if stats_y + 20 < y + h then begin
-    let n_young = List.length young_allocs in
-    let n_old = List.length old_allocs in
-    let n_freed = List.length freed in
-    let stats =
-      Printf.sprintf "young: %d   old: %d   freed: %d" n_young n_old n_freed
-    in
-    draw_text stats (s (x + pad)) (s stats_y) (s font_size_sm) col_dim
-  end;
-  let fiber_y = stats_y + font_size_sm + (pad * 2) in
-  if fiber_y + 20 < y + h then begin
-    draw_rectangle
-      (s (x + pad))
-      (s (fiber_y - pad))
-      (s (w - (pad * 2)))
-      1 col_border;
-    draw_section_title (x + pad) fiber_y "FIBERS";
-    let news, yields, resumes = con_events_at state.trace state.pb.tick in
-    let n_fibers = List.length news in
-    let n_yielded = List.length yields in
-    let n_resumed = List.length resumes in
-    for i = 0 to n_fibers - 1 do
-      let fy = fiber_y + font_size_md + pad + (i * 28) in
-      if fy < y + h - pad then begin
-        let is_running = i < n_resumed in
-        let is_yielded = i < n_yielded in
-        let status, color =
-          if is_running then ("running", col_fiber_run)
-          else if is_yielded then ("suspended", col_fiber_sus)
-          else ("dead", col_fiber_dead)
+  let rows_y = min 3 (max 1 ((n_young + cols_n - 1) / cols_n)) in
+  let rows_o = min 3 (max 1 ((n_old + cols_n - 1) / cols_n)) in
+  draw_cells young rows_y;
+  cy := !cy + (rows_y * (cell + gap)) + 3;
+  draw_cells old rows_o;
+  cy := !cy + (rows_o * (cell + gap)) + 8
+
+let draw_inspector state x y w h =
+  if not state.insp.active then ()
+  else begin
+    panel2 x y w h;
+    let cy = ref (y + pad) in
+    draw_txt (x + pad) !cy fmd col_accent "INSPECT";
+    cy := !cy + fmd + 6;
+    let addr = state.insp.addr in
+    draw_txt (x + pad) !cy fxs col_dim (Printf.sprintf "heap addr  %d" addr);
+    cy := !cy + fxs + 8;
+    draw_rect (x + pad) !cy (w - (pad * 2)) 1 col_border;
+    cy := !cy + 6;
+    let all = allocs_at state state.pb.tick in
+    let freed = frees_at state state.pb.tick in
+    let proms = promotes_at state state.pb.tick in
+    match List.find_opt (fun (_, a, _, _) -> a = addr) all with
+    | None -> draw_txt (x + pad) !cy fsm col_dim2 "(not yet allocated)"
+    | Some (_, _, size, tag) ->
+        let is_freed = List.mem addr freed in
+        let is_old = List.mem addr proms in
+        let kv lbl v vc =
+          draw_txt (x + pad) !cy fxs col_dim lbl;
+          draw_txt (x + pad + 64) !cy fxs vc v;
+          cy := !cy + fxs + 5
         in
-        draw_rectangle
-          (s (x + pad))
-          (s fy)
-          (s (w - (pad * 2)))
-          (s 22)
-          (Color.create 28 28 38 255);
-        draw_circle (s (x + pad + 14)) (s (fy + 11)) (s 5 |> float_of_int) color;
-        let label = Printf.sprintf "fiber_%d" i in
-        draw_text label
-          (s (x + pad + 28))
-          (s (fy + 4))
-          (s font_size_sm) col_text;
-        draw_text status
-          (s (x + pad + 28 + 80))
-          (s (fy + 4))
-          (s font_size_sm) color
-      end
-    done;
-    ignore n_yielded;
-    ignore n_resumed
+        kv "tag" (string_of_int tag) col_yellow;
+        kv "size" (Printf.sprintf "%d words" size) col_text;
+        kv "gen"
+          (if is_old then "old" else "young")
+          (if is_old then col_old else col_young);
+        kv "freed"
+          (if is_freed then "yes" else "no")
+          (if is_freed then col_red else col_green);
+        cy := !cy + 4;
+        draw_rect (x + pad) !cy (w - (pad * 2)) 1 col_border;
+        cy := !cy + 6;
+        section_hdr (x + pad) !cy (w - (pad * 2)) "FIELDS";
+        cy := !cy + fxs + 8;
+        let writes = (thp state).writes in
+        for field = 0 to size - 1 do
+          let last_v = ref Value.Nil in
+          Array.iter
+            (fun (t, a, f, v) ->
+              if t <= state.pb.tick && a = addr && f = field then last_v := v)
+            writes;
+          draw_txt (x + pad) !cy fxs col_dim (Printf.sprintf "[%d]" field);
+          draw_txt
+            (x + pad + 36)
+            !cy fxs (value_col !last_v) (value_str !last_v);
+          cy := !cy + fxs + 4
+        done
   end
 
-let draw_gc_overlay state x y w =
-  let gc = state.trace.Trace.Serializer.Read.gc.events in
-  let in_gc = ref false in
+let draw_event_track state x y w =
+  draw_rect x y w event_h col_panel;
+  draw_rect x (y + event_h - 1) w 1 col_border;
+  let total = float_of_int (max 1 state.total_ticks) in
+  let tx t = x + int_of_float (float_of_int t /. total *. float_of_int w) in
   Array.iter
     (fun (t, ev) ->
-      if t <= state.pb.tick then
+      let ec, eh =
         match ev with
-        | Heap.Minor_start | Heap.Major_mark _ -> in_gc := true
-        | Heap.Minor_end _ | Heap.Major_end -> in_gc := false
-        | _ -> ())
-    gc;
-  if !in_gc then begin
-    draw_rectangle (s x) (s y) (s w) (s 4) col_red;
-    draw_rectangle
-      (s (x + w - 60))
-      (s (y + 6))
-      (s 52) (s 20)
-      (Color.create 60 20 20 255);
-    draw_text "GC" (s (x + w - 52)) (s (y + 8)) (s font_size_sm) col_red
-  end
+        | Heap.Minor_start -> (col_young, event_h / 2)
+        | Heap.Minor_end _ -> (col_accent, event_h / 2)
+        | Heap.Major_mark _ -> (col_old, event_h)
+        | Heap.Major_sweep _ -> (col_purple, event_h)
+        | Heap.Major_end -> (col_red, event_h)
+      in
+      draw_rect (tx t) (y + event_h - eh) 2 eh ec)
+    (tgc state).events;
+  Array.iter
+    (fun (t, _, _) -> draw_rect (tx t) y 1 (event_h / 3) col_green)
+    (tvm state).calls;
+  Array.iter
+    (fun (t, _, _) -> draw_rect (tx t) y 1 (event_h / 3) col_teal)
+    (tvm state).con_yields;
+  draw_rect (tx state.pb.tick) y 2 event_h col_recent
 
 let draw_instr_bar state x y w =
-  draw_panel x y w instr_h;
-  match current_instr state.trace state.pb.tick with
-  | None ->
-      draw_text "no instruction"
-        (s (x + pad))
-        (s (y + (instr_h / 2) - (font_size_sm / 2)))
-        (s font_size_sm) col_dim
-  | Some (tick, pc, op) -> (
-      let tick_str = Printf.sprintf "tick %05d / %05d" tick state.total_ticks in
-      draw_text tick_str (s (x + pad)) (s (y + pad)) (s font_size_sm) col_dim;
+  panel x y w instr_h;
+  let mid = y + (instr_h / 2) in
+  match current_instr state state.pb.tick with
+  | None -> draw_txt (x + pad) (mid - (fsm / 2)) fsm col_dim "(no instruction)"
+  | Some (tick, pc, op) ->
+      draw_txt (x + pad)
+        (mid - fxs - 2)
+        fxs col_dim
+        (Printf.sprintf "t=%05d / %05d" tick state.total_ticks);
+      draw_txt (x + pad) (mid + 2) fxs col_dim (Printf.sprintf "pc=%-6d" pc);
+      let cat_col = op_col op in
       let op_str = op_name op in
-      draw_rectangle
-        (s (x + pad + 160))
-        (s (y + 6))
-        (s 120)
-        (s (instr_h - 12))
-        (Color.create 30 40 60 255);
-      draw_text op_str
-        (s (x + pad + 168))
-        (s (y + pad))
-        (s font_size_lg) col_accent;
-      let pc_str = Printf.sprintf "pc = %d" pc in
-      draw_text pc_str
-        (s (x + pad + 300))
-        (s (y + pad))
-        (s font_size_sm) col_dim;
-      let reg_writes = state.trace.Trace.Serializer.Read.vm.reg_writes in
-      let last_write = ref None in
-      Array.iter
-        (fun (t, r, v) -> if t = tick then last_write := Some (r, v))
-        reg_writes;
-      match !last_write with
-      | None -> ()
-      | Some (r, v) ->
-          let ws = Printf.sprintf "r%d <- %s" r (value_to_string v) in
-          draw_text ws
-            (s (x + pad + 460))
-            (s (y + pad))
-            (s font_size_sm) col_highlight)
+      let badge_x = x + pad + 118 in
+      let mid_y = y + (instr_h / 2) in
+      let bh = instr_h - 16 in
+      draw_rect badge_x (mid_y - (bh / 2)) 3 bh cat_col;
+      draw_txt (badge_x + 8) (mid_y - (flg / 2)) flg cat_col op_str;
+      let writes = writes_at_tick state tick in
+      let wx = ref (badge_x + 140) in
+      List.iter
+        (fun (_, r, v) ->
+          if !wx + 100 < x + w - pad then begin
+            let y_pos = mid - (fxs / 2) in
+            draw_txt !wx y_pos fxs col_dim (Printf.sprintf "r%d" r);
+            draw_txt (!wx + 18) y_pos fxs col_dim2 "<-";
+            draw_txt (!wx + 36) y_pos fxs (value_col v)
+              (clamp_str (value_str v) 10);
+            wx := !wx + 108
+          end)
+        writes
 
 let draw_scrubber state x y w =
-  draw_panel x y w ctrl_h;
+  panel x y w ctrl_h;
   let total = float_of_int (max 1 state.total_ticks) in
   let t = float_of_int state.pb.tick /. total in
-  let btn_area = 180 in
-  let spd_area = 130 in
-  let track_x = x + pad + btn_area in
-  let track_w = w - (pad * 2) - btn_area - spd_area in
+  let btn_w = 160 and spd_w = 110 in
+  let track_x = x + pad + btn_w in
+  let track_w = w - (pad * 2) - btn_w - spd_w in
   let track_y = y + (ctrl_h / 2) - 4 in
-  draw_rectangle (s track_x) (s track_y) (s track_w) (s 8) col_scrubber;
-  let filled_w = int_of_float (t *. float_of_int track_w) in
-  draw_rectangle (s track_x) (s track_y) (s filled_w) (s 8) col_accent;
-  let thumb_x = track_x + filled_w in
-  draw_circle (s thumb_x) (s (track_y + 4)) (s 9 |> float_of_int) col_thumb;
-  let btn_y = y + (ctrl_h / 2) - 11 in
-  draw_text "|<" (s (x + pad)) (s btn_y) (s font_size_md) col_text;
-  draw_text "<" (s (x + pad + 36)) (s btn_y) (s font_size_md) col_text;
-  let play_str = if state.pb.playing then "||" else ">" in
-  draw_text play_str (s (x + pad + 68)) (s btn_y) (s font_size_md) col_accent;
-  draw_text ">" (s (x + pad + 96)) (s btn_y) (s font_size_md) col_text;
-  draw_text ">|" (s (x + pad + 124)) (s btn_y) (s font_size_md) col_text;
-  let spd_x = x + w - spd_area + pad in
-  let speed_str = Printf.sprintf "%.1fx" state.pb.speed in
-  draw_text speed_str (s spd_x) (s btn_y) (s font_size_md) col_yellow;
-  let bar_w = spd_area - pad - 20 in
-  let filled_spd = int_of_float (state.pb.speed /. 4.0 *. float_of_int bar_w) in
-  draw_rectangle (s spd_x)
-    (s (btn_y + font_size_md + 4))
-    (s bar_w) (s 5) col_scrubber;
-  draw_rectangle (s spd_x)
-    (s (btn_y + font_size_md + 4))
-    (s filled_spd) (s 5) col_yellow
+  draw_rect track_x track_y track_w 8 col_scrubber;
+  let fw = int_of_float (t *. float_of_int track_w) in
+  draw_rect track_x track_y fw 8 col_accent;
+  draw_circ (track_x + fw) (track_y + 4) 7 col_thumb;
+  let by = y + (ctrl_h / 2) - (fmd / 2) in
+  let play_lbl = if state.pb.playing then "||" else " >" in
+  let btns =
+    [| ("|<", 0); (" <", 30); (play_lbl, 58); (" >", 88); (">|", 116) |]
+  in
+  Array.iter
+    (fun (lbl, bx) ->
+      let col = if lbl = play_lbl then col_accent else col_text in
+      draw_txt (x + pad + bx) by fmd col lbl)
+    btns;
+  let sx = x + w - spd_w + pad in
+  draw_txt sx by fmd col_yellow (Printf.sprintf "%.1fx" state.pb.speed);
+  let bw = spd_w - pad - 16 in
+  let fs = int_of_float (state.pb.speed /. 4.0 *. float_of_int bw) in
+  draw_rect sx (by + fmd + 4) bw 4 col_scrubber;
+  draw_rect sx (by + fmd + 4) fs 4 col_yellow
 
 let draw_topbar state =
-  draw_rectangle 0 0 screen_w (s bar_h) col_panel;
-  draw_rectangle 0 (s bar_h - 1) screen_w 1 col_border;
-  draw_text "MAPVIZ" (s pad)
-    (s ((bar_h / 2) - (font_size_lg / 2)))
-    (s font_size_lg) col_accent;
-  let tick_info =
-    Printf.sprintf "tick %d / %d" state.pb.tick state.total_ticks
-  in
-  draw_text tick_info
-    (s (pad + 120))
-    (s ((bar_h / 2) - (font_size_sm / 2)))
-    (s font_size_sm) col_dim;
-  let btn_w = 108 in
-  let btn_gap = 4 in
-  let btn_y = (s bar_h - s 28) / 2 in
-  let modes = [| "Registers"; "Heap"; "Both" |] in
+  draw_rect 0 0 sw bar_h col_panel;
+  draw_rect 0 (bar_h - 1) sw 1 col_border;
+  draw_txt pad ((bar_h / 2) - (flg / 2)) flg col_accent "Map.Viz";
+  draw_txt (pad + 90)
+    ((bar_h / 2) - (fxs / 2))
+    fxs col_dim
+    (Printf.sprintf "tick %d / %d" state.pb.tick state.total_ticks);
+  let depth = call_depth state state.pb.tick in
+  draw_txt (pad + 210)
+    ((bar_h / 2) - (fxs / 2))
+    fxs col_dim
+    (Printf.sprintf "depth %d" depth);
+  if in_gc state state.pb.tick then begin
+    draw_rect (pad + 290)
+      ((bar_h / 2) - ((fxs + 4) / 2))
+      60 (fxs + 4) (c 60 10 10);
+    draw_txt (pad + 294) ((bar_h / 2) - (fxs / 2)) fxs col_red "GC"
+  end;
+  if state.insp.active then begin
+    draw_rect (pad + 360)
+      ((bar_h / 2) - ((fsm + 4) / 2))
+      180 (fsm + 4) (c 18 28 50);
+    draw_txt (pad + 366)
+      ((bar_h / 2) - (fsm / 2))
+      fsm col_accent
+      (Printf.sprintf "insp ptr(%d)" state.insp.addr)
+  end;
+  let btn_w = 90 and btn_gap = 3 in
+  let modes = [| ("Regs", Registers); ("Heap", Heap); ("Both", Both) |] in
   Array.iteri
-    (fun i label ->
-      let bx =
-        screen_w - s (3 * (btn_w + btn_gap)) - s pad + (i * s (btn_w + btn_gap))
-      in
-      let active =
-        match state.mode with
-        | Registers -> i = 0
-        | Heap -> i = 1
-        | Both -> i = 2
-      in
-      draw_rectangle bx btn_y (s btn_w) (s 28)
+    (fun i (lbl, mode) ->
+      let bx = sw - (3 * (btn_w + btn_gap)) - pad + (i * (btn_w + btn_gap)) in
+      let active = state.mode = mode in
+      draw_rect bx
+        ((bar_h / 2) - 12)
+        btn_w 24
         (if active then col_accent else col_scrubber);
-      draw_text label
-        (bx + s 8)
-        (btn_y + s 5)
-        (s font_size_sm)
-        (if active then col_bg else col_text))
+      draw_rect_l bx ((bar_h / 2) - 12) btn_w 24 col_border;
+      draw_txt (bx + 6)
+        ((bar_h / 2) - (fsm / 2))
+        fsm
+        (if active then col_bg else col_text)
+        lbl)
     modes
+
+let content_y () = bar_h
+let content_h () = sh - bar_h - instr_h - event_h - ctrl_h
+let instr_y () = content_y () + content_h ()
+let event_y () = instr_y () + instr_h
+let scrub_y () = event_y () + event_h
+let reg_panel_w = 280
+let stack_h = 140
+let con_h = 120
+let insp_w = 210
 
 let handle_input state =
   let dt = get_frame_time () in
@@ -562,11 +824,10 @@ let handle_input state =
   if state.hl.age > 0.0 then
     state.hl.age <- max 0.0 (state.hl.age -. (dt *. 2.0));
   if is_key_pressed Key.Space then state.pb.playing <- not state.pb.playing;
-  if is_key_pressed Key.Right then
-    if state.pb.tick < state.total_ticks - 1 then
-      state.pb.tick <- state.pb.tick + 1;
-  if is_key_pressed Key.Left then
-    if state.pb.tick > 0 then state.pb.tick <- state.pb.tick - 1;
+  if is_key_pressed Key.Right && state.pb.tick < state.total_ticks - 1 then
+    state.pb.tick <- state.pb.tick + 1;
+  if is_key_pressed Key.Left && state.pb.tick > 0 then
+    state.pb.tick <- state.pb.tick - 1;
   if is_key_pressed Key.Home then state.pb.tick <- 0;
   if is_key_pressed Key.End then state.pb.tick <- state.total_ticks - 1;
   if is_key_pressed Key.Tab then
@@ -575,82 +836,150 @@ let handle_input state =
       | Registers -> Heap
       | Heap -> Both
       | Both -> Registers);
+  if is_key_pressed Key.Escape then state.insp.active <- false;
+  let mx = int_of_float (float_of_int (get_mouse_x ()) /. scale) in
+  let my = int_of_float (float_of_int (get_mouse_y ()) /. scale) in
   let wheel = get_mouse_wheel_move () in
-  if wheel <> 0.0 then
-    state.pb.speed <- max 0.1 (min 4.0 (state.pb.speed +. (wheel *. 0.1)));
-  let mx = get_mouse_x () in
-  let my = get_mouse_y () in
-  let scrub_y = screen_h - s ctrl_h in
-  let btn_area = 180 in
-  let spd_area = 130 in
-  let track_x = s (pad + btn_area) in
-  let track_w = screen_w - s (pad * 2) - s btn_area - s spd_area in
+  let cy = content_y () and ch = content_h () in
+  let reg_h = ch - stack_h - con_h in
+  let reg_right =
+    match state.mode with Registers -> sw | Both -> reg_panel_w | Heap -> 0
+  in
+  let in_reg_body = mx >= 0 && mx < reg_right && my >= cy && my < cy + reg_h in
+  let in_stack_body =
+    mx >= 0 && mx < reg_right && my >= cy + reg_h && my < cy + reg_h + stack_h
+  in
+  let in_con_body =
+    mx >= 0 && mx < reg_right && my >= cy + reg_h + stack_h && my < cy + ch
+  in
+  let in_heap =
+    match state.mode with
+    | Heap -> mx >= 0 && mx < sw && my >= cy && my < cy + ch
+    | Both -> mx >= reg_panel_w && mx < sw && my >= cy && my < cy + ch
+    | _ -> false
+  in
+  if wheel <> 0.0 then begin
+    let d = -int_of_float wheel in
+    if in_reg_body then
+      state.reg_scroll.offset <- max 0 (state.reg_scroll.offset + d)
+    else if in_stack_body then
+      state.stack_scroll.offset <- max 0 (state.stack_scroll.offset + d)
+    else if in_con_body then
+      state.con_scroll.offset <- max 0 (state.con_scroll.offset + d)
+    else if in_heap then
+      state.heap_scroll.offset <- max 0 (state.heap_scroll.offset + d)
+    else state.pb.speed <- max 0.1 (min 4.0 (state.pb.speed +. (wheel *. 0.1)))
+  end;
+  let sy = scrub_y () in
+  let btn_w = 160 and spd_w = 110 in
+  let track_x = pad + btn_w in
+  let track_w = sw - (pad * 2) - btn_w - spd_w in
   if
     is_mouse_button_down MouseButton.Left
-    && my >= scrub_y
-    && my <= scrub_y + s ctrl_h
+    && my >= sy
+    && my <= sy + ctrl_h
     && mx >= track_x
     && mx <= track_x + track_w
   then begin
     let t = float_of_int (mx - track_x) /. float_of_int track_w in
-    state.pb.tick <- int_of_float (t *. float_of_int state.total_ticks);
-    state.pb.tick <- max 0 (min (state.total_ticks - 1) state.pb.tick);
+    state.pb.tick <-
+      max 0
+        (min (state.total_ticks - 1)
+           (int_of_float (t *. float_of_int state.total_ticks)));
     state.pb.playing <- false
   end;
-  let btn_y = scrub_y + (s ctrl_h / 2) - s 11 in
-  if
-    is_mouse_button_pressed MouseButton.Left
-    && my >= btn_y
-    && my <= btn_y + s 22
-  then begin
-    if mx >= s pad && mx <= s (pad + 30) then state.pb.tick <- 0;
-    if mx >= s (pad + 36) && mx <= s (pad + 60) then
+  let by = sy + (ctrl_h / 2) - (fmd / 2) in
+  if is_mouse_button_pressed MouseButton.Left && my >= by && my <= by + fmd then begin
+    if mx >= pad && mx < pad + 28 then state.pb.tick <- 0;
+    if mx >= pad + 30 && mx < pad + 56 then
       if state.pb.tick > 0 then state.pb.tick <- state.pb.tick - 1;
-    if mx >= s (pad + 68) && mx <= s (pad + 90) then
+    if mx >= pad + 58 && mx < pad + 84 then
       state.pb.playing <- not state.pb.playing;
-    if mx >= s (pad + 96) && mx <= s (pad + 120) then
+    if mx >= pad + 88 && mx < pad + 114 then
       if state.pb.tick < state.total_ticks - 1 then
         state.pb.tick <- state.pb.tick + 1;
-    if mx >= s (pad + 124) && mx <= s (pad + 160) then
+    if mx >= pad + 116 && mx < pad + 152 then
       state.pb.tick <- state.total_ticks - 1
   end;
-  if is_mouse_button_pressed MouseButton.Left && my >= 0 && my <= s bar_h then begin
-    let btn_w = 108 in
-    let btn_gap = 4 in
-    let modes_x = screen_w - s (3 * (btn_w + btn_gap)) - s pad in
-    if mx >= modes_x && mx <= modes_x + s btn_w then state.mode <- Registers;
+  let btn_w2 = 90 and btn_gap = 3 in
+  let bx0 = sw - (3 * (btn_w2 + btn_gap)) - pad in
+  if is_mouse_button_pressed MouseButton.Left && my >= 0 && my <= bar_h then begin
+    if mx >= bx0 && mx < bx0 + btn_w2 then state.mode <- Registers;
+    if mx >= bx0 + btn_w2 + btn_gap && mx < bx0 + (2 * (btn_w2 + btn_gap)) then
+      state.mode <- Heap;
     if
-      mx >= modes_x + s (btn_w + btn_gap)
-      && mx <= modes_x + s (2 * (btn_w + btn_gap))
-    then state.mode <- Heap;
-    if
-      mx >= modes_x + s (2 * (btn_w + btn_gap))
-      && mx <= modes_x + s (3 * (btn_w + btn_gap))
+      mx >= bx0 + (2 * (btn_w2 + btn_gap)) && mx < bx0 + (3 * (btn_w2 + btn_gap))
     then state.mode <- Both
+  end;
+  if is_mouse_button_pressed MouseButton.Right && in_reg_body then begin
+    let active = active_regs state state.pb.tick in
+    let sparse =
+      let acc = ref [] in
+      for i = 255 downto 0 do
+        if Hashtbl.mem active i then acc := i :: !acc
+      done;
+      !acc
+    in
+    let hdr_h = pad + fmd + 6 in
+    let body_y = cy + hdr_h + 1 in
+    let row = (my - body_y) / row_h in
+    let idx = state.reg_scroll.offset + row in
+    if idx >= 0 && idx < List.length sparse then begin
+      let reg = List.nth sparse idx in
+      match reg_value_at state state.pb.tick reg with
+      | Some (Value.Ptr addr) ->
+          state.insp.active <- true;
+          state.insp.addr <- addr
+      | _ -> state.insp.active <- false
+    end
+  end;
+  let ey = event_y () in
+  if is_mouse_button_pressed MouseButton.Left && my >= ey && my < ey + event_h
+  then begin
+    let t = float_of_int mx /. float_of_int sw in
+    state.pb.tick <-
+      max 0
+        (min (state.total_ticks - 1)
+           (int_of_float (t *. float_of_int state.total_ticks)))
   end
 
 let draw state =
   begin_drawing ();
   clear_background col_bg;
   draw_topbar state;
-  let content_y = bar_h in
-  let content_h = sh - bar_h - instr_h - ctrl_h in
-  let instr_y = content_y + content_h in
-  let scrub_y = instr_y + instr_h in
+  let cy = content_y () in
+  let ch = content_h () in
+  let iy = instr_y () in
+  let ey = event_y () in
+  let sby = scrub_y () in
+  let reg_h = ch - stack_h - con_h in
+  if in_gc state state.pb.tick then draw_rect 0 0 sw 2 col_red;
   (match state.mode with
   | Registers ->
-      draw_registers state 0 content_y sw content_h;
-      draw_gc_overlay state 0 content_y sw
+      let rw = if state.insp.active then sw - insp_w else sw in
+      draw_registers state 0 cy rw reg_h;
+      draw_call_stack state 0 (cy + reg_h) rw stack_h;
+      draw_continuations state 0 (cy + reg_h + stack_h) rw con_h;
+      if state.insp.active then draw_inspector state rw cy insp_w ch
   | Heap ->
-      draw_heap state 0 content_y sw content_h;
-      draw_gc_overlay state 0 content_y sw
+      let hw = if state.insp.active then sw - insp_w else sw in
+      draw_heap state 0 cy hw ch;
+      if state.insp.active then draw_inspector state hw cy insp_w ch
   | Both ->
-      let half = sw / 2 in
-      draw_registers state 0 content_y half content_h;
-      draw_heap state half content_y (sw - half) content_h;
-      draw_gc_overlay state 0 content_y sw);
-  draw_instr_bar state 0 instr_y sw;
-  draw_scrubber state 0 scrub_y sw;
+      let heap_x = reg_panel_w in
+      let heap_w =
+        if state.insp.active then sw - reg_panel_w - insp_w
+        else sw - reg_panel_w
+      in
+      draw_registers state 0 cy reg_panel_w reg_h;
+      draw_call_stack state 0 (cy + reg_h) reg_panel_w stack_h;
+      draw_continuations state 0 (cy + reg_h + stack_h) reg_panel_w con_h;
+      draw_heap state heap_x cy heap_w ch;
+      if state.insp.active then
+        draw_inspector state (heap_x + heap_w) cy insp_w ch);
+  draw_instr_bar state 0 iy sw;
+  draw_event_track state 0 ey sw;
+  draw_scrubber state 0 sby sw;
   end_drawing ()
 
 let run path =
@@ -661,12 +990,16 @@ let run path =
       trace;
       pb = { tick = 0; playing = false; speed = 1.0; accum = 0.0 };
       hl = { reg = None; addr = None; age = 0.0 };
+      insp = { active = false; addr = 0 };
+      reg_scroll = { offset = 0 };
+      stack_scroll = { offset = 0 };
+      heap_scroll = { offset = 0 };
+      con_scroll = { offset = 0 };
       mode = Both;
-      show_settings = false;
       total_ticks;
     }
   in
-  init_window screen_w screen_h "MAPVIZ -- MAP Virtual Machine Inspector";
+  init_window screen_w screen_h "Map.Viz";
   set_target_fps 60;
   while not (window_should_close ()) do
     handle_input state;

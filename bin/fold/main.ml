@@ -2,50 +2,48 @@ open Mapv
 open Mapv.Core
 open Mapv.Bytecode
 
-let factorial_code =
+let gc_pressure_code =
   Instr.
     [|
-      Load (1, 10);
-      Load (2, 1);
-      Load (3, 0);
-      Eq (4, 1, 3);
-      Jnz (4, 56);
-      Mul (2, 2, 1);
-      SubI (1, 1, 1);
-      Jmp 24;
-      ConYield (0, 2);
-      Halt;
-    |]
-
-let fibonacci_code =
-  Instr.
-    [|
-      Load (1, 10);
-      Load (2, 0);
-      Load (3, 1);
-      Load (4, 0);
-      Lt (5, 4, 1);
-      Jz (5, 72);
-      Add (6, 2, 3);
-      Mov (2, 3);
-      Mov (3, 6);
-      AddI (4, 4, 1);
-      Jmp 32;
-      ConYield (0, 2);
-      Halt;
+      (* 0 *) Load (1, 1000);
+      (* 1 *) Load (11, 0);
+      (* 2 *) Lt (3, 11, 1);
+      (* 3 *) Jz (3, 24);
+      (* 4 *) Alloc (4, 0, 10);
+      (* 5 *) Alloc (5, 0, 10);
+      (* 6 *) Alloc (6, 0, 10);
+      (* 7 *) Load (2, 100000);
+      (* 8 *) Alloc (12, 0, 10);
+      (* 9 *) SetField (12, 0, 2);
+      (* 10 *) SubI (2, 2, 1);
+      (* 11 *) Lt (13, 11, 2);
+      (* 12 *) Jnz (13, 8);
+      (* 13 *) Alloc (10, 1, 5);
+      (* 14 *) SetField (10, 0, 4);
+      (* 15 *) Mov (4, 10);
+      (* 16 *) Load (12, 2);
+      (* 17 *) Mod (13, 1, 12);
+      (* 18 *) Eq (13, 13, 11);
+      (* 19 *) Jz (13, 22);
+      (* 20 *) Alloc (14, 2, 500);
+      (* 21 *) SubI (1, 1, 1);
+      (* 22 *) ConYield (0, 11);
+      (* 23 *) Jmp 2;
+      (* 24 *) Halt;
     |]
 
 let scheduler_code =
   Instr.
     [|
-      LoadK (0, 1);
-      LoadK (1, 2);
-      ConNew (2, 0);
-      ConNew (3, 1);
-      LoadNil 4;
-      ConResume (5, 2, 4);
-      ConResume (6, 3, 4);
-      Halt;
+      (* 1 *) LoadK (0, 1);
+      (* 2 *) ConNew (1, 0);
+      (* 3 *) LoadNil 2;
+      (* 4 *) ConResume (3, 1, 2);
+      (* 5 *) ConStatus (4, 1);
+      (* 6 *) Load (5, 1);
+      (* 7 *) Eq (6, 4, 5);
+      (* 8 *) Jnz (6, 3);
+      (* 9 *) Halt;
     |]
 
 let program : Serializer.program =
@@ -56,8 +54,7 @@ let program : Serializer.program =
     funcs =
       [|
         { name = "scheduler"; arity = 0; code = scheduler_code };
-        { name = "factorial"; arity = 0; code = factorial_code };
-        { name = "fibonacci"; arity = 0; code = fibonacci_code };
+        { name = "gc_pressure"; arity = 0; code = gc_pressure_code };
       |];
     debug = [||];
   }
@@ -66,35 +63,28 @@ let () =
   let module H = Heap.Make (Heap.Tracing) in
   let module VM = Vm.Make (H) (Vm.Tracing) in
   let module L = Loader.Make (H) (VM) in
-  ignore (Serializer.serialize_to_file "_fiber_demo.mapv" program);
-  let loaded = Serializer.deserialize_from_file "_fiber_demo.mapv" in
-  Array.iter
-    (fun (f : Serializer.func) ->
-      Printf.printf "%s (arity=%d):\n" f.name f.arity;
-      Instr.inspect f.code;
-      print_newline ())
-    loaded.funcs;
+  let config =
+    {
+      Config.default with
+      heap = { chunk_size = 128; young_limit = 256; max_chunks = 128 };
+      gc = { major_threshold = 128; major_growth_factor = 1.1 };
+    }
+  in
+
+  ignore (Serializer.serialize_to_file "_gc_crush.mapv" program);
+
   let heap_ctx =
-    Heap.Tracing.make ~max_chunks:Config.default.heap.max_chunks
-      ~chunk_size:Config.default.heap.chunk_size ~sample_rate:10
+    Heap.Tracing.make ~max_chunks:config.heap.max_chunks
+      ~chunk_size:config.heap.chunk_size ~sample_rate:1
   in
   let vm_ctx = Vm.Tracing.make () in
-  let vm = L.load_file "_fiber_demo.mapv" Config.default heap_ctx vm_ctx in
+  let vm = L.load_file "_gc_crush.mapv" config heap_ctx vm_ctx in
+
   (match VM.run vm with
   | () -> ()
-  | exception Exception.Signal s ->
-      Printf.printf "uncaught signal: %s\n" (Exception.signal_message s);
-      exit 1
-  | exception Exception.Panic p ->
-      Printf.printf "panic: %s\n" (Exception.panic_to_string p);
+  | exception e ->
+      Printf.printf "VM Panic: %s\n" (Printexc.to_string e);
       exit 1);
-  Printf.printf "status: %s\n" (VM.get_status vm);
-  let check name got expected =
-    Printf.printf "%s = %d  [expected %d]  %s\n" name got expected
-      (if got = expected then "PASS" else "FAIL")
-  in
-  check "factorial(10)" (Value.to_int (VM.get_reg vm 5)) 3628800;
-  check "fibonacci(10)" (Value.to_int (VM.get_reg vm 6)) 55;
-  Trace.Serializer.serialize_to_file "_fiber_demo.mapvt" vm_ctx heap_ctx;
-  Printf.printf "trace written to _fiber_demo.mapvt\n";
-  Viz.Renderer.run "_fiber_demo.mapvt"
+
+  Trace.Serializer.serialize_to_file "_gc_crush.mapvt" vm_ctx heap_ctx;
+  Viz.Renderer.run "_gc_crush.mapvt"

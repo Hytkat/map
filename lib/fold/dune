@@ -1,0 +1,6 @@
+(include_subdirs qualified)
+
+(library
+ (name fold)
+ (public_name fold)
+ (libraries mapv raylib))

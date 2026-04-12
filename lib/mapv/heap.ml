@@ -145,6 +145,7 @@ module type S = sig
   val is_card_dirty : t -> int -> bool
   val clear_card : t -> int -> unit
   val needs_minor_gc : t -> bool
+  val run_finalizers_young : t -> unit
   val reset_young : t -> unit
   val chunk_size : t -> int
   val on_gc : t -> event -> unit
@@ -167,17 +168,16 @@ module Make (H : TRACER) : S with type tracer_ctx = H.ctx = struct
   let min_free_size = 3
 
   let size_class sz =
-    match sz with
-    | 2 | 3 -> 0
-    | 4 -> 1
-    | 5 | 6 -> 2
-    | 7 | 8 -> 3
-    | n when n <= 16 -> 4
-    | n when n <= 32 -> 5
-    | n when n <= 64 -> 6
-    | n when n <= 128 -> 7
-    | n when n <= 256 -> 8
-    | _ -> 9
+    if sz <= 3 then 0
+    else if sz = 4 then 1
+    else if sz <= 6 then 2
+    else if sz <= 8 then 3
+    else if sz <= 16 then 4
+    else if sz <= 32 then 5
+    else if sz <= 64 then 6
+    else if sz <= 128 then 7
+    else if sz <= 256 then 8
+    else 9
 
   type chunk = {
     data : Value.t array;
@@ -195,6 +195,7 @@ module Make (H : TRACER) : S with type tracer_ctx = H.ctx = struct
     chunk_mask : int;
     mutable young : int;
     mutable alloc_count : int;
+    mutable old_live_words : int;
     young_limit : int;
     card_table : bytes;
     tracer_ctx : H.ctx;
@@ -298,6 +299,7 @@ module Make (H : TRACER) : S with type tracer_ctx = H.ctx = struct
       chunk_mask = mask;
       young = 0;
       alloc_count = 0;
+      old_live_words = 0;
       young_limit = cfg.young_limit;
       card_table = Bytes.make cfg.max_chunks '\000';
       tracer_ctx = ctx;
@@ -390,34 +392,30 @@ module Make (H : TRACER) : S with type tracer_ctx = H.ctx = struct
               let addr = (!ci * t.chunk_size) + !cur + header_words in
               set_header t addr ~tag ~size:actual_size ~mark:false;
               Array.fill c.data (!cur + header_words) actual_size Value.Nil;
+              t.old_live_words <- t.old_live_words + actual_size;
               found := addr
             end
             else cur := next
           done;
           incr cls
-        done
-      end;
-      incr ci
-    done;
-    if !found = -1 then begin
-      ci := 0;
-      while !found = -1 && !ci < t.n_chunks do
-        let c = t.chunks.(!ci) in
-        if c.gen = Old && c.top + needed <= c.size then begin
+        done;
+        if !found = -1 && c.top + needed <= c.size then begin
           let addr = (!ci * t.chunk_size) + c.top + header_words in
           set_header t addr ~tag ~size ~mark:false;
           c.top <- c.top + needed;
+          t.old_live_words <- t.old_live_words + size;
           found := addr
-        end;
-        incr ci
-      done
-    end;
+        end
+      end;
+      incr ci
+    done;
     if !found = -1 then begin
       let idx = add_chunk t Old in
       let c = t.chunks.(idx) in
       let addr = (idx * t.chunk_size) + c.top + header_words in
       set_header t addr ~tag ~size ~mark:false;
       c.top <- c.top + needed;
+      t.old_live_words <- t.old_live_words + size;
       found := addr
     end;
     H.on_alloc t.tracer_ctx ~addr:!found ~size ~tag;
@@ -434,6 +432,7 @@ module Make (H : TRACER) : S with type tracer_ctx = H.ctx = struct
       | _ -> ()
     done;
     Array.fill c.data (slot + header_words) size Value.Nil;
+    t.old_live_words <- max 0 (t.old_live_words - size);
     let mut_slot = ref slot in
     let mut_size = ref size in
     let next_slot = slot + header_words + size in
@@ -492,7 +491,6 @@ module Make (H : TRACER) : S with type tracer_ctx = H.ctx = struct
   let needs_minor_gc t = t.alloc_count >= t.young_limit
 
   let reset_young t =
-    run_finalizers_young t;
     for i = 0 to t.n_chunks - 1 do
       let c = t.chunks.(i) in
       if c.gen = Young then begin
@@ -500,7 +498,8 @@ module Make (H : TRACER) : S with type tracer_ctx = H.ctx = struct
         Array.fill c.data 0 c.size Value.Nil
       end
     done;
-    t.alloc_count <- 0
+    t.alloc_count <- 0;
+    t.young <- 0
 
   let chunk_size t = t.chunk_size
 
@@ -539,22 +538,19 @@ module Make (H : TRACER) : S with type tracer_ctx = H.ctx = struct
   let stats t =
     let yu = ref 0 in
     let yt = ref 0 in
-    let ou = ref 0 in
     let ot = ref 0 in
     for i = 0 to t.n_chunks - 1 do
       let c = t.chunks.(i) in
       if c.gen = Young then (
         yu := !yu + c.top;
         yt := !yt + c.size)
-      else (
-        ou := !ou + c.top;
-        ot := !ot + c.size)
+      else ot := !ot + c.size
     done;
     {
       young_used = !yu;
       young_total = !yt;
       young_limit = t.young_limit;
-      old_used = !ou;
+      old_used = t.old_live_words;
       old_total = !ot;
       n_chunks = t.n_chunks;
       alloc_count = t.alloc_count;

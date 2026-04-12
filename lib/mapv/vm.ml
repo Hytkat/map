@@ -23,6 +23,7 @@ type con_state =
   | Con_dead
 
 type continuation = {
+  id : int;
   mutable state : con_state;
   program : bytes;
   constants : Value.t array;
@@ -35,9 +36,9 @@ module type TRACER = sig
   val on_call : ctx -> pc:int -> target:int -> unit
   val on_ret : ctx -> pc:int -> unit
   val on_throw : ctx -> pc:int -> unit
-  val on_con_new : ctx -> pc:int -> unit
-  val on_con_yield : ctx -> pc:int -> unit
-  val on_con_resume : ctx -> pc:int -> unit
+  val on_con_new : ctx -> pc:int -> int
+  val on_con_yield : ctx -> con_id:int -> pc:int -> unit
+  val on_con_resume : ctx -> con_id:int -> pc:int -> unit
   val on_reg_write : ctx -> reg:int -> value:Value.t -> unit
 end
 
@@ -48,9 +49,9 @@ module No_tracing = struct
   let on_call () ~pc:_ ~target:_ = ()
   let on_ret () ~pc:_ = ()
   let on_throw () ~pc:_ = ()
-  let on_con_new () ~pc:_ = ()
-  let on_con_yield () ~pc:_ = ()
-  let on_con_resume () ~pc:_ = ()
+  let on_con_new () ~pc:_ = 0
+  let on_con_yield () ~con_id:_ ~pc:_ = ()
+  let on_con_resume () ~con_id:_ ~pc:_ = ()
   let on_reg_write () ~reg:_ ~value:_ = ()
 end
 
@@ -61,8 +62,9 @@ module Tracing = struct
     mutable rets : (int * int) list;
     mutable throws : (int * int) list;
     mutable con_news : (int * int) list;
-    mutable con_yields : (int * int) list;
-    mutable con_resumes : (int * int) list;
+    mutable con_yields : (int * int * int) list;
+    mutable con_resumes : (int * int * int) list;
+    mutable con_count : int;
     mutable tick : int;
     mutable reg_writes : (int * int * Value.t) list;
   }
@@ -76,6 +78,7 @@ module Tracing = struct
       con_news = [];
       con_yields = [];
       con_resumes = [];
+      con_count = 0;
       tick = 0;
       reg_writes = [];
     }
@@ -87,11 +90,18 @@ module Tracing = struct
   let on_call ctx ~pc ~target = ctx.calls <- (ctx.tick, pc, target) :: ctx.calls
   let on_ret ctx ~pc = ctx.rets <- (ctx.tick, pc) :: ctx.rets
   let on_throw ctx ~pc = ctx.throws <- (ctx.tick, pc) :: ctx.throws
-  let on_con_new ctx ~pc = ctx.con_news <- (ctx.tick, pc) :: ctx.con_news
-  let on_con_yield ctx ~pc = ctx.con_yields <- (ctx.tick, pc) :: ctx.con_yields
 
-  let on_con_resume ctx ~pc =
-    ctx.con_resumes <- (ctx.tick, pc) :: ctx.con_resumes
+  let on_con_new ctx ~pc =
+    let id = ctx.con_count in
+    ctx.con_news <- (ctx.tick, pc) :: ctx.con_news;
+    ctx.con_count <- ctx.con_count + 1;
+    id
+
+  let on_con_yield ctx ~con_id ~pc =
+    ctx.con_yields <- (ctx.tick, con_id, pc) :: ctx.con_yields
+
+  let on_con_resume ctx ~con_id ~pc =
+    ctx.con_resumes <- (ctx.tick, con_id, pc) :: ctx.con_resumes
 
   let on_reg_write ctx ~reg ~value =
     ctx.reg_writes <- (ctx.tick, reg, value) :: ctx.reg_writes
@@ -146,6 +156,7 @@ module Make (H : Heap.S) (T : TRACER) :
     tracer_ctx : T.ctx;
     symbols : symbol_registry;
     mutable current_continuation : continuation option;
+    mutable live_continuations : continuation list;
   }
 
   let create (cfg : Config.t) program heap_ctx tracer_ctx =
@@ -156,28 +167,41 @@ module Make (H : Heap.S) (T : TRACER) :
       program;
       regs = Array.make 256 Value.Nil;
       frames =
-        Array.make cfg.vm.call_depth
-          {
-            return_pc = 0;
-            ret_dst = 0;
-            reg_base = 0;
-            program;
-            handler_base = 0;
-            is_continuation_frame = false;
-          };
+        Array.init cfg.vm.call_depth (fun _ ->
+            {
+              return_pc = 0;
+              ret_dst = 0;
+              reg_base = 0;
+              program;
+              handler_base = 0;
+              is_continuation_frame = false;
+            });
       frame_sp = 0;
       handlers =
-        Array.make cfg.vm.exception_depth
-          { handler_pc = 0; handler_frame = 0; handler_reg = 0 };
+        Array.init cfg.vm.exception_depth (fun _ ->
+            { handler_pc = 0; handler_frame = 0; handler_reg = 0 });
       handler_sp = 0;
       pc = 0;
       status = Running;
       tracer_ctx;
       symbols = Hashtbl.create 64;
       current_continuation = None;
+      live_continuations = [];
     }
 
-  let roots vm = [| vm.regs; vm.constants |]
+  let collect_continuation_roots con =
+    match con.state with
+    | Con_suspended { saved_regs; caller_regs; _ } ->
+        [| saved_regs; caller_regs |]
+    | Con_running { caller_regs } -> [| caller_regs |]
+    | Con_dead -> [||]
+
+  let roots vm =
+    let con_roots =
+      Array.concat (List.map collect_continuation_roots vm.live_continuations)
+    in
+    Array.append [| vm.regs; vm.constants |] con_roots
+
   let fault vm msg = vm.status <- Fault msg
 
   let current_program vm =
@@ -736,7 +760,11 @@ module Make (H : Heap.S) (T : TRACER) :
                       | Con_running { caller_regs } ->
                           Array.blit caller_regs 0 vm.regs 0 256
                       | _ -> ());
-                      con.state <- Con_dead
+                      con.state <- Con_dead;
+                      vm.live_continuations <-
+                        List.filter
+                          (fun c -> c.id <> con.id)
+                          vm.live_continuations
                   | None -> ());
                   vm.current_continuation <- None
                 end;
@@ -773,14 +801,15 @@ module Make (H : Heap.S) (T : TRACER) :
                 vm.pc <- pc4
               end
           | 0x90 -> (
-              T.on_con_new vm.tracer_ctx ~pc;
               match vm.regs.(base + b) with
               | Value.Ptr addr when H.get_tag vm.heap addr = Tag.closure -> (
                   let code_ptr = H.read vm.heap addr 0 in
                   match Value.get_native Value.bytecode_id code_ptr with
                   | Some code ->
+                      let con_id = T.on_con_new vm.tracer_ctx ~pc in
                       let con =
                         {
+                          id = con_id;
                           state =
                             Con_suspended
                               {
@@ -796,6 +825,7 @@ module Make (H : Heap.S) (T : TRACER) :
                         Value.make_native ~tag:continuation_id ~finalizer:None
                           con
                       in
+                      vm.live_continuations <- con :: vm.live_continuations;
                       vm.regs.(base + a) <- con_ptr;
                       T.on_reg_write vm.tracer_ctx ~reg:(base + a)
                         ~value:con_ptr;
@@ -805,33 +835,31 @@ module Make (H : Heap.S) (T : TRACER) :
                   fault vm "ConNew: native functions cannot be continuations"
               | _ -> fault vm "ConNew: expected closure Ptr")
           | 0x91 -> (
-              T.on_con_yield vm.tracer_ctx ~pc;
               match vm.current_continuation with
               | None -> fault vm "ConYield: no active continuation"
               | Some con ->
+                  T.on_con_yield vm.tracer_ctx ~con_id:con.id ~pc;
                   let yield_val = vm.regs.(base + b) in
                   let frame = vm.frames.(vm.frame_sp - 1) in
                   let saved_regs = Array.copy vm.regs in
-                  (match con.state with
-                  | Con_running { caller_regs } ->
-                      con.state <-
-                        Con_suspended
-                          { resume_pc = pc4; saved_regs; caller_regs }
-                  | _ -> fault vm "ConYield: continuation not in running state");
+                  let caller_regs =
+                    match con.state with
+                    | Con_running { caller_regs } -> caller_regs
+                    | _ ->
+                        fault vm "ConYield: continuation not in running state";
+                        vm.regs
+                  in
+                  con.state <-
+                    Con_suspended { resume_pc = pc4; saved_regs; caller_regs };
                   vm.current_continuation <- None;
                   vm.handler_sp <- frame.handler_base;
                   vm.frame_sp <- vm.frame_sp - 1;
                   vm.pc <- frame.return_pc;
-                  Array.blit
-                    (match con.state with
-                    | Con_suspended { caller_regs; _ } -> caller_regs
-                    | _ -> vm.regs)
-                    0 vm.regs 0 256;
+                  Array.blit caller_regs 0 vm.regs 0 256;
                   vm.regs.(frame.ret_dst) <- yield_val;
                   T.on_reg_write vm.tracer_ctx ~reg:frame.ret_dst
                     ~value:yield_val)
           | 0x92 -> (
-              T.on_con_resume vm.tracer_ctx ~pc;
               match vm.regs.(base + b) with
               | Value.NativePtr _ as con_v -> (
                   match Value.get_native continuation_id con_v with
@@ -841,6 +869,7 @@ module Make (H : Heap.S) (T : TRACER) :
                       | Con_running _ ->
                           fault vm "ConResume: continuation already running"
                       | Con_suspended { resume_pc; saved_regs; _ } ->
+                          T.on_con_resume vm.tracer_ctx ~con_id:con.id ~pc;
                           let arg = vm.regs.(base + c) in
                           let caller_regs = Array.copy vm.regs in
                           con.state <- Con_running { caller_regs };
@@ -885,6 +914,7 @@ module Make (H : Heap.S) (T : TRACER) :
     vm.handler_sp <- 0;
     vm.status <- Running;
     vm.current_continuation <- None;
+    vm.live_continuations <- [];
     Array.fill vm.regs 0 (Array.length vm.regs) Value.Nil
 
   let is_done vm = match vm.status with Running -> false | _ -> true
